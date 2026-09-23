@@ -1,0 +1,84 @@
+# Source ingestion is separately gated by ENABLE_CONNECTORS=true.
+# National news city mentions remain candidates, not confirmed event locations.
+sources:
+  - id: lsm-culture
+    name: LSM Culture
+    country: lv
+    language: en
+    kind: rss
+    url: https://eng.lsm.lv/rss/?lang=en&catid=277
+    enabled: true
+    interval_seconds: 300
+  - id: lsm-transport
+    name: LSM Transport
+    country: lv
+    language: en
+    kind: rss
+    event_kind: disruption
+    url: https://eng.lsm.lv/rss/?lang=en&catid=21662
+    enabled: true
+    interval_seconds: 300
+  - id: lsm-weather
+    name: LSM Weather
+    country: lv
+    language: en
+    kind: rss
+    event_kind: weather
+    url: https://eng.lsm.lv/rss/?lang=en&catid=318
+    enabled: true
+    interval_seconds: 300
+  - id: err-news
+    name: ERR News
+    country: ee
+    kind: rss
+    url: https://news.err.ee/rss
+    language: en
+    enabled: true
+    interval_seconds: 300
+  - id: lrt-english
+    name: LRT English
+    country: lt
+    language: en
+    kind: rss
+    url: https://www.lrt.lt/en/news-in-english?rss
+    enabled: true
+    interval_seconds: 300
+  - id: visit-estonia
+    name: Visit Estonia tourism API
+    country: ee
+    kind: json
+    url: https://puhkaeestis.ee/et/turismiprofessionaalile/visitestonia-api-veebiteenus
+    url_env: VISIT_ESTONIA_API_URL
+    token_env: VISIT_ESTONIA_API_TOKEN
+    enabled: false
+    reason: Publisher approval and response field mapping required
+    # Set items_path and field_map to the approved API response schema.
+    interval_seconds: 1800
+  - id: live-riga
+    name: LiveRiga calendar
+    country: lv
+    city_ids: ["lv:riga"]
+    kind: html_jsonld
+    url: https://www.liveriga.com/en/3-events
+    enabled: false
+    reason: Validate permitted access and JSON-LD availability first
+    authoritative: true
+    interval_seconds: 1800
+  - id: latvia-calendar
+    name: Latvia Travel calendar
+    country: lv
+    kind: html_jsonld
+    url: https://www.latvia.travel/en/calendar
+    enabled: false
+    reason: Validate permitted access and structured data first
+    interval_seconds: 3600
+  - id: vilnius-events
+    name: Vilnius Events
+    country: lt
+    city_ids: ["lt:vilnius"]
+    kind: html_jsonld
+    url: https://www.vilnius-events.lt/
+    enabled: false
+    reason: Validate permitted access and JSON-LD availability first
+    authoritative: true
+    interval_seconds: 1800
