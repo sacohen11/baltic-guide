@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.engine import make_url
 
-from observatory.db import Database, agents, deadletters, facts, inbox, metadata, notifications, outbox
+from observatory.db import Database, agents, deadletters, facts, inbox, metadata, notifications, outbox, raw_records
 from observatory.runtime import Runtime
 from observatory.service import Service
 from observatory.settings import Settings
@@ -54,6 +54,7 @@ async def test_real_kafka_postgres_delivery_restart_retraction():
     await runtime.start()
     try:
         accept(service, lvk())
+        assert db.rows(outbox), f"Ingestion produced no outbox message: raw={db.rows(raw_records)}"
         await until(
             lambda: any(n["payload"].get("case_id") == "lvk:S260923abc" for n in db.rows(notifications))
         )
