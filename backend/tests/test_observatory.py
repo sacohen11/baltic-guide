@@ -215,6 +215,37 @@ async def test_background_wakes_sleeping_agent(service):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_graph_before_closing_checkpoint(service):
+    import threading
+
+    runtime = Runtime(service)
+    runtime.setup_graphs()
+    with service.db.tx() as c:
+        service.enqueue(c, "lvk", "heartbeat", {}, "shutdown-test")
+    started = threading.Event()
+    release = threading.Event()
+    original_run = runtime.graphs.run
+
+    def slow_graph(job):
+        started.set()
+        assert release.wait(5)
+        return original_run(job)
+
+    runtime.graphs.run = slow_graph
+    worker = asyncio.create_task(runtime.run_one())
+    runtime.background = [worker]
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        stopping = asyncio.create_task(runtime.stop())
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+    finally:
+        release.set()
+    await asyncio.wait_for(stopping, 5)
+    assert worker.done()
+
+
+@pytest.mark.asyncio
 async def test_missing_gcn_credentials_is_explicit(service):
     service.settings.gcn_client_id = service.settings.gcn_client_secret = ""
     with pytest.raises(RuntimeError, match="credentials"):

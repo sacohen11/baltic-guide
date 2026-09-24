@@ -380,7 +380,15 @@ class Runtime:
             with self.tracer.start_as_current_span("agent.run") as span:
                 span.set_attribute("agent.id", job["agent_id"])
                 span.set_attribute("job.id", job["id"])
-                result = await asyncio.to_thread(self.graphs.run, job)
+                # asyncio.to_thread keeps running after its awaiter is cancelled. Keep
+                # ownership of the task so shutdown cannot close the checkpointer
+                # while its SQLite/Postgres writes are still in flight.
+                graph_task = asyncio.create_task(asyncio.to_thread(self.graphs.run, job))
+                try:
+                    result = await asyncio.shield(graph_task)
+                except asyncio.CancelledError:
+                    await graph_task
+                    raise
                 self.finish(job, token, result)
             RUNS.labels(level, "success").inc()
         except LeaseLost:

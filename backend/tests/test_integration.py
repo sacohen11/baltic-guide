@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.engine import make_url
 
-from observatory.db import Database, facts, metadata, notifications
+from observatory.db import Database, agents, deadletters, facts, inbox, metadata, notifications, outbox
 from observatory.runtime import Runtime
 from observatory.service import Service
 from observatory.settings import Settings
@@ -42,7 +42,13 @@ async def test_real_kafka_postgres_delivery_restart_retraction():
             if predicate():
                 return
             await asyncio.sleep(0.1)
-        pytest.fail("Timed out waiting for durable Kafka delivery")
+        pytest.fail(
+            "Timed out waiting for durable Kafka delivery; "
+            f"inbox={[(r['agent_id'], r['state'], r['error']) for r in db.rows(inbox)]}; "
+            f"outbox={[(r['topic'], r['published_at'], r['error']) for r in db.rows(outbox)]}; "
+            f"agents={[(r['id'], r['runs'], r['last_error']) for r in db.rows(agents)]}; "
+            f"deadletters={db.rows(deadletters)}"
+        )
 
     runtime = Runtime(service)
     await runtime.start()
