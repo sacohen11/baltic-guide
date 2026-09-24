@@ -22,7 +22,7 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
-      - run: docker build -t baltic-guide:ci .
+      - run: docker build -t space-observatory:ci .
   kafka-postgres:
     runs-on: ubuntu-latest
     services:

@@ -46,7 +46,7 @@ def task_proto(row):
     result = pb.Task(id=row["id"], context_id=row["context_id"], status=status)
     if row.get("result"):
         result.artifacts.append(
-            pb.Artifact(artifact_id=row["id"], name="Guide briefing", parts=[data_part(row["result"])])
+            pb.Artifact(artifact_id=row["id"], name="Observer briefing", parts=[data_part(row["result"])])
         )
     return result
 
@@ -58,7 +58,7 @@ class ContextBuilder(ServerCallContextBuilder):
         return context
 
 
-class BalticHandler(RequestHandler):
+class ObservatoryHandler(RequestHandler):
     def __init__(self, service, agent_id, handlers):
         self.service, self.agent_id, self.handlers = service, agent_id, handlers
 
@@ -109,7 +109,7 @@ class BalticHandler(RequestHandler):
                 params.message.context_id or None,
                 c=c,
             )
-            if query.verify and AGENTS[self.agent_id].level != "city":
+            if query.verify and AGENTS[self.agent_id].level not in {"instrument", "circulars"}:
                 self.delegate(c, task, query)
         if not params.configuration.return_immediately:
             for _ in range(300):
@@ -124,13 +124,8 @@ class BalticHandler(RequestHandler):
             if depth >= 2:
                 return
             for child in child_agents(aid):
-                if query.city_ids:
-                    if child.city_id and child.city_id not in query.city_ids:
-                        continue
-                    if child.level == "country" and not any(
-                        cid.startswith(child.country + ":") for cid in query.city_ids
-                    ):
-                        continue
+                if query.families and child.family and child.family not in query.families:
+                    continue
                 request = {
                     **query.model_dump(mode="json"),
                     "agent_id": child.id,
@@ -252,13 +247,13 @@ class BalticHandler(RequestHandler):
 def mount_a2a(app, service):
     handlers = {}
     for agent in AGENTS.values():
-        handler = BalticHandler(service, agent.id, handlers)
+        handler = ObservatoryHandler(service, agent.id, handlers)
         handlers[agent.id] = handler
         base = f"{service.settings.public_url.rstrip('/')}/a2a/{agent.id}"
         card = pb.AgentCard(
             name=agent.name,
-            description=f"{agent.level.title()} tourism intelligence with durable event-driven execution.",
-            version="0.1.0",
+            description=f"{agent.level.title()} astronomy intelligence with durable event-driven execution.",
+            version="1.0.0",
             supported_interfaces=[
                 pb.AgentInterface(url=base + "/", protocol_binding="JSONRPC", protocol_version="1.0")
             ],
@@ -270,21 +265,20 @@ def mount_a2a(app, service):
                     id="briefing",
                     name="Evidence-backed briefing",
                     description="Query current events and changes with citations.",
-                    tags=["tourism", agent.level],
+                    tags=["astronomy", agent.level],
                 ),
                 pb.AgentSkill(
                     id="verify",
                     name="Verify stored evidence",
-                    description="Delegate scoped checks to child agents; does not imply contacting organizers.",
+                    description="Delegate scoped checks to child agents; preserves uncertainty and source revisions.",
                     tags=["verification"],
                 ),
             ],
         )
-        if not service.settings.demo_mode:
-            card.security_schemes["bearer"].CopyFrom(
-                pb.SecurityScheme(http_auth_security_scheme=pb.HTTPAuthSecurityScheme(scheme="Bearer"))
-            )
-            card.security_requirements.add().schemes["bearer"].SetInParent()
+        card.security_schemes["bearer"].CopyFrom(
+            pb.SecurityScheme(http_auth_security_scheme=pb.HTTPAuthSecurityScheme(scheme="Bearer"))
+        )
+        card.security_requirements.add().schemes["bearer"].SetInParent()
         sub = FastAPI()
         sub.router.routes += create_agent_card_routes(card)
         sub.router.routes += create_jsonrpc_routes(handler, rpc_url="/", context_builder=ContextBuilder())

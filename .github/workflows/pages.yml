@@ -1,0 +1,51 @@
+name: Deploy observatory frontend to GitHub Pages
+on:
+  workflow_run:
+    workflows: ["Test and build"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        # Pages must be enabled in repository Settings > Pages > GitHub Actions.
+        # Enabling Pages itself needs administration access unavailable to GITHUB_TOKEN.
+      - name: Build the real frontend
+        run: npm run build
+        working-directory: frontend
+        env:
+          VITE_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
+          VITE_API_BASE_URL: ${{ vars.OBSERVATORY_API_URL }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+      - name: Publish frontend
+        id: deployment
+        uses: actions/deploy-pages@v4

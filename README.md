@@ -1,100 +1,100 @@
-# Baltic Guide
+# Space Observatory
 
-A working event-driven application for tourist guides: **30 city agents, three country agents, and one Baltic coordinator**, with a live React dashboard, persistent LangGraph workflows, Kafka transport, and A2A task endpoints.
+A live multi-messenger observatory built on NASA GCN's **external Kafka streams**. It replaces the Baltic tourist-guide application in this repository. There is no demo feed, seed button, simulated live mode, or RSS-to-Kafka substitute.
 
-An agent is a durable identity and state, executed by shared workers. Idle agents consume no model tokens. Warm consumers keep listening; incoming observations wake the appropriate agents without waiting for their maintenance heartbeat.
+The application contains a React/TypeScript dashboard, FastAPI backend, PostgreSQL persistence, internal Kafka routing, a native external GCN consumer, durable LangGraph workers, and A2A 1.0 interfaces.
 
-## Run the application
+## What it does
 
-Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and Node 24+.
+- Seven instrument agents: Fermi GBM/LAT, Swift BAT/XRT/UVOT, LVK, and IceCube.
+- Three signal-family coordinators: electromagnetic, gravitational waves, and neutrinos.
+- One whole-sky coordinator and one shared Circulars agent: **12 permanent agents**.
+- Persistent case agents created from publisher event identifiers. They link explicit references across instruments, retain revisions, and track retractions.
+- Live briefing cards, agent questions and delegated checks, subscriptions, source health, original payload downloads, and authenticated observer accounts.
+- Optional model analysis using a configured OpenAI-compatible chat-completions endpoint. Without a model, ingestion and source-backed structured briefings work, but free-text questions return an evidence dossier rather than inferred answers. The UI labels this clearly.
+
+## Run the real application on your computer
+
+Install Docker Desktop, then:
 
 ```sh
+git clone https://github.com/sacohen11/baltic-guide.git
+cd baltic-guide
 cp .env.example .env
+```
+
+1. Sign in at [NASA GCN](https://gcn.nasa.gov/quickstart), create Kafka client credentials, and set `GCN_CLIENT_ID` and `GCN_CLIENT_SECRET` in `.env`.
+2. Run `openssl rand -hex 32` **twice**. Use the results for `ADMIN_TOKEN` and `POSTGRES_PASSWORD`, respectively.
+3. Set `LLM_MODEL`, `LLM_API_KEY`, and, if needed, `LLM_BASE_URL` to enable agent reasoning. Credentials stay in the backend environment. Never put these values in frontend build variables.
+4. Start the services:
+
+```sh
+docker compose up --build -d
+docker compose ps
+docker compose logs -f ingestor worker
+```
+
+Open **http://localhost:8000**, use that URL as the backend URL, and sign in with your `ADMIN_TOKEN`. The dashboard starts empty. Incoming real GCN records populate it. Some scientific streams are quiet for long periods: a healthy connection does not imply frequent alerts.
+
+`GCN_AUTO_OFFSET_RESET=latest` starts a new consumer group at the live edge. To read available historical records, use `earliest` and a **new** `GCN_GROUP_ID`. Existing groups resume committed offsets regardless of this setting. Kafka retention limits historical availability. Replayed historical records keep their original timestamps.
+
+The default subscribes to all topics in `backend/observatory/registry.py`. If GCN reports a topic unavailable, check your credentials and current topic access. Set `GCN_TOPICS` to an explicit comma-separated supported subset if needed; the dashboard marks the other subscriptions as inactive. The consumer does not silently pretend missing topics are connected.
+
+## Host the backend permanently
+
+GitHub Pages hosts static frontend files. It cannot run Python, PostgreSQL, Kafka consumers, or agent workers. The backend must run on an always-on computer or server with Docker, outbound access to GCN Kafka on port 9092, and HTTPS access to GCN OAuth and the configured model endpoint.
+
+On that host, follow the preceding setup, then point a domain's DNS at the server. In `.env` set:
+
+```dotenv
+OBSERVATORY_DOMAIN=observatory.example.com
+PUBLIC_URL=https://observatory.example.com
+CORS_ORIGINS=https://sacohen11.github.io,https://observatory.example.com
+```
+
+Replace the example domain with your real domain. Open inbound ports 80 and 443 and start Caddy's HTTPS profile:
+
+```sh
+docker compose --profile https up --build -d
+```
+
+Caddy obtains and renews a TLS certificate. Database and Kafka ports remain private; the API's direct host port is bound to loopback. This is a single-host deployment with persistent volumes, not a highly available cluster. Back up PostgreSQL and monitor disk usage before sustained operation. See [operations](docs/operations.md).
+
+## Publish the frontend to GitHub Pages
+
+The repository includes a Pages deployment workflow. It runs after **Test and build** succeeds on `main`, and can also be run manually.
+
+1. In repository **Settings → Pages**, select **GitHub Actions** as the source. A private repository must have a GitHub plan that supports Pages for private repositories. Publishing the frontend does not change repository visibility.
+2. Optionally set repository Actions variable `OBSERVATORY_API_URL` to your HTTPS backend origin. This is a public URL, **not a secret**. If unset, enter the backend URL on the sign-in screen.
+3. Run **Deploy observatory frontend to GitHub Pages** under Actions, or push a tested change to `main`.
+4. Use the exact site URL reported by the deployment job. The expected project URL is `https://sacohen11.github.io/baltic-guide/` once Pages is enabled and deployment succeeds.
+
+GCN/model credentials and access tokens must never be repository variables or baked into the Pages bundle. Users enter their own observer token at runtime. The frontend keeps it in session storage. To create a restricted observer token, POST a name to `/api/observers` using the admin token; the response shows the new token once.
+
+If `configure-pages` reports a missing site, enable Pages in Settings first. The standard Actions token cannot enable a new Pages site because that needs repository administration permissions.
+
+## Development and tests
+
+```sh
 uv sync --frozen --extra dev
 cd frontend
 npm ci
-npm run build
-cd ..
-uv run baltic demo
-uv run baltic serve
-```
-
-Open **http://localhost:8000**. The seeded scenario is explicitly illustrative, uses example.org source links, and needs no external credentials. The app also has a “Load scenario” button. Try the cancellation scenario, inspect a city agent, or ask the coordinator to verify a question across selected cities.
-
-Alternatively, with Docker:
-
-```sh
-docker compose -f compose.demo.yaml up --build
-```
-
-Open the dashboard and load the scenario. Stop with `docker compose -f compose.demo.yaml down`; the named volume preserves data. The local mode uses SQLite and a transactional local event transport. It runs the same agent workflows and schemas as Kafka mode, but is not a Kafka emulator.
-
-## What is implemented
-
-- Configuration-based roster of 34 agents, 30 dedicated city topics, national inputs, and country/Baltic findings.
-- Kafka consumers, transactional inbox/outbox, manual offset commits, duplicate suppression, per-agent leases, fencing, retries, and dead letters.
-- Separate FastAPI, worker, and connector processes; Postgres and Kafka Docker deployment.
-- Three LangGraph workflows with persistent checkpoints, scoped factual memory, bounded delegation, and optional model assessments and answers.
-- RSS/Atom, JSON-LD events, mapped JSON APIs, and non-recurring ICS connectors with source health, conditional requests, size limits, and backoff.
-- Versioned evidence, source conflicts, out-of-order protection, cancellations, event expiry, and recommendation retraction.
-- Date-overlap theme detection: at least three cities for a country theme or two countries for a Baltic theme.
-- Official A2A SDK HTTP endpoints for every agent: discovery, send/get/list/cancel tasks, streaming updates, structured result artifacts.
-- Guide-specific preferences, token authentication, live SSE inbox, source links, save/acknowledge/dismiss/mute/verification actions, and reconnect cursors.
-- Health/readiness endpoints, Prometheus metrics, optional OpenTelemetry export, tests, CI, and deployment manifests.
-
-## Enable real information
-
-The shipped source registry includes enabled LSM culture/transport/weather, ERR News, and LRT English feeds. Scheduled fetching is off in the demo to keep the scenario isolated. Set `ENABLE_CONNECTORS=true` and restart the embedded server, or run `uv run baltic connectors` as a separate process. Source rows show actual fetch health and freshness.
-
-The LSM culture, ERR News, and LRT English URLs were fetched and parsed during implementation. This proves those endpoints returned usable feeds at that time; it does not establish complete coverage of all cities. News city mentions can wake city agents, with a visible “mentioned in source” qualification. They are never treated as confirmed event venues or used as event-theme evidence.
-
-City calendars and the Visit Estonia API are registered but disabled until publisher access and response parsing are configured. Use [source onboarding](docs/sources.md) to add authoritative local calendars. You can also submit validated observations through the ingestion API. The 30-city roster is the seed set from the application plan; it is not a newly audited official population ranking.
-
-## Configure model reasoning
-
-Set `LLM_MODEL`, `LLM_API_KEY`, and optionally `LLM_BASE_URL` in `.env`. The adapter accepts a compatible `/chat/completions` endpoint. No model is selected implicitly.
-
-The model provides a bounded agent assessment only when its evidence snapshot changes, and answers guide questions. Evidence-backed cards and theme eligibility use deterministic rules. A shared daily token reservation limit (`LLM_DAILY_TOKEN_BUDGET`) prevents unbounded calls; reservations are deliberately conservative and are not billing measurements. A failed model call or exhausted budget falls back to an evidence-only answer. Idle unchanged heartbeats do not call the model. Source content is passed as untrusted evidence; agents have no shell, booking, or messaging tools.
-
-## Kafka and Postgres deployment
-
-```sh
-cp .env.example .env
-# Set distinct random ADMIN_TOKEN (24+ characters) and POSTGRES_PASSWORD in .env.
-# Use a URL-safe generated database password, e.g. secrets.token_hex(32).
-docker compose up --build -d
-# Optional scheduled live ingestion:
-docker compose --profile live up -d
-```
-
-The production Compose file forces `DEMO_MODE=false`, `TRANSPORT=kafka`, and a separate worker. Enter the admin token in the dashboard, or create individual guides using `POST /api/guides`. The returned guide token is shown once and stored only as a hash server-side. The browser retains the entered token in session storage.
-
-This Compose deployment is one broker and one database, suitable for a single host pilot. For high availability use managed/redundant Kafka and Postgres, TLS, backups, an HTTPS gateway, and the Kubernetes template in `deploy/k8s/`. Configure `PUBLIC_URL` for externally usable A2A Agent Cards. See [operations](docs/operations.md) for exact deployment and recovery guidance.
-
-## Development and verification
-
-```sh
-uv run ruff check backend scripts
-uv run pytest -q
-cd frontend
 npm test
 npm run build
+cd ..
+uv run ruff check backend scripts
+uv run pytest -q
 ```
 
-Backend tests cover event delivery, replay/deduplication, cancellation/retraction, time overlap, exclusive leases and fencing, restart, tenant isolation, official SDK round trips, live background workers, bounded delegation, and connector parsing. Frontend tests exercise filtering, preferences, card actions, queries, and agent inspection.
+Tests use explicit isolated fixtures. They are never loaded by the application. The Kafka/PostgreSQL integration test runs in CI using disposable service containers; locally it runs only when `TEST_DATABASE_URL` and `TEST_KAFKA_BOOTSTRAP` are set. Tests cover normalization, source schema variations, duplicate delivery, revision ordering, retractions, test-event isolation, leased job recovery, authentication, A2A, and browser connection behavior.
 
-The optional integration test uses real Kafka and Postgres:
+`TRANSPORT=local` is an internal database-backed transport for development/tests; it does not provide synthetic data. The deployment uses internal Kafka. The external ingestor always consumes real Kafka.
 
-```sh
-TEST_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@localhost:5432/baltic_test \
-TEST_KAFKA_BOOTSTRAP=localhost:19092 \
-uv run pytest -q backend/tests/test_integration.py
-```
+## Read more
 
-**Use a disposable database**: that test resets application tables, and requires `test` in the database name. CI runs it with dedicated service containers. Docker/Kafka/Postgres integration could not be executed in the implementation workspace because those runtimes were unavailable. Local background-worker tests use real SQLite transactions and the local transport. Model behavior is tested through a mock compatible endpoint; no paid provider call is claimed.
+- [Architecture and scientific boundaries](docs/architecture.md)
+- [External topics and parser references](docs/sources.md)
+- [API and A2A](docs/api.md)
+- [Operations, backups, and recovery](docs/operations.md)
 
-See [architecture](docs/architecture.md), [API examples](docs/api.md), and [operations](docs/operations.md). OpenAPI is served at `/docs`; JSON Schemas are checked into `config/schemas.json`.
-
-## Boundaries
-
-This is a runnable application with deployment code, not an already hosted service. It does not claim universal municipal coverage, semantic/geospatial accuracy, a measured sub-second latency SLO, or external organizer verification. “Verify” checks the agents' currently stored source evidence. A2A supports new tasks rather than task continuation, and does not advertise push notifications. Current evidence is archived in the database; a separate object store, external schema registry, OIDC identity provider, and semantic vector search are not required or included. See the operations guide for capacity and retention limits.
+The application is independent software consuming NASA GCN. Participating observatories include non-NASA facilities. Source-provided classifications, probabilities, and search results remain source claims; an LLM cannot turn overlapping reports into a confirmed discovery.

@@ -1,52 +1,53 @@
-from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
-from baltic.db import Database
-from baltic.runtime import Runtime
-from baltic.schemas import Observation
-from baltic.service import Service
-from baltic.settings import Settings
+from observatory.db import Database
+from observatory.gcn import GCNIngestor
+from observatory.runtime import Runtime
+from observatory.service import Service
+from observatory.settings import Settings
 
 
 @pytest.fixture
 def service(tmp_path):
     settings = Settings(
         database_url=f"sqlite:///{tmp_path}/test.db",
-        embedded_runtime=False,
-        sources_file="missing.yaml",
+        transport="local",
+        admin_token="test-only-token-at-least-24-characters",
+        model="",
+        model_api_key="",
         checkpoint_dir=str(tmp_path / "checkpoints"),
     )
-    service = Service(Database(settings.database_url), settings)
-    service.bootstrap()
-    yield service
-    service.db.engine.dispose()
+    db = Database(settings.database_url)
+    result = Service(db, settings)
+    result.bootstrap()
+    yield result
+    db.engine.dispose()
 
 
 @pytest.fixture
 def runtime(service):
-    rt = Runtime(service)
-    rt.setup_graphs()
-    yield rt
-    rt.stack.close()
+    result = Runtime(service)
+    yield result
+    result.stack.close()
 
 
-@pytest.fixture
-def observation():
-    start = datetime.now(UTC) + timedelta(days=3)
-    return Observation(
-        source_id="test",
-        source_item_id="a",
-        entity_id="event-a",
-        country="lv",
-        city_ids=["lv:riga"],
-        source_url="https://example.org/event-a",
-        title="Winter market",
-        summary="An organizer-reported market.",
-        kind="event",
-        status="scheduled",
-        tags=["christmas"],
-        starts_at=start,
-        ends_at=start + timedelta(days=10),
-        authoritative=True,
-    )
+def lvk(name="S260923abc", kind="INITIAL", time="2026-09-23T12:00:00Z"):
+    return {
+        "superevent_id": name,
+        "alert_type": kind,
+        "time_created": time,
+        "event": None
+        if kind == "RETRACTION"
+        else {
+            "time": "2026-09-23T11:59:00Z",
+            "far": 1e-9,
+            "classification": {"BNS": 0.8, "BBH": 0.1, "Noise": 0.1},
+            "skymap": "cmF3LW1hcA==",
+        },
+    }
+
+
+def accept(service, body, offset=0, topic="igwn.gwalert"):
+    return GCNIngestor(service).accept(topic, 0, offset, json.dumps(body).encode())

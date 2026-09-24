@@ -9,7 +9,7 @@ from sqlalchemy import select, update, text
 
 from .db import agents, inbox, outbox, tasks, facts, runtime_health, deadletters
 from .graphs import Graphs
-from .registry import AGENTS, TOPIC_AGENT, SYSTEM_TOPICS
+from .registry import TOPIC_AGENT, SYSTEM_TOPICS
 from .schemas import digest
 from .telemetry import RUNS, LATENCY, DURATION, setup
 
@@ -143,7 +143,7 @@ class Runtime:
                         with self.db.tx() as c:
                             self.service.emit(
                                 c,
-                                "baltic.deadletter.v1",
+                                "observatory.deadletter.v1",
                                 str(record.offset),
                                 {
                                     "topic": record.topic,
@@ -172,7 +172,7 @@ class Runtime:
     def claim(self):
         now = time.time()
         with self.db.tx() as c:
-            # Order agents by last run to prevent a noisy capital monopolizing workers.
+            # Order agents by last run to prevent a noisy instrument monopolizing workers.
             available = select(inbox.c.agent_id).where(
                 inbox.c.state.in_(["pending", "running"]), inbox.c.available_at <= now
             )
@@ -181,7 +181,7 @@ class Runtime:
                     select(agents.c.id)
                     .where(agents.c.id.in_(available), agents.c.lease_until < now)
                     .order_by(agents.c.last_run)
-                    .limit(34)
+                    .limit(100)
                 )
                 .scalars()
                 .all()
@@ -216,6 +216,15 @@ class Runtime:
                     continue
                 job = dict(row)
                 if job["kind"] == "task":
+                    task_state = c.execute(
+                        select(tasks.c.state).where(tasks.c.id == job["payload"]["task_id"])
+                    ).scalar_one()
+                    if task_state == "canceled":
+                        c.execute(update(inbox).where(inbox.c.id == job["id"]).values(state="done"))
+                        c.execute(
+                            update(agents).where(agents.c.id == aid).values(lease_until=0, lease_token=None)
+                        )
+                        continue
                     waiting = c.execute(
                         select(tasks.c.id)
                         .where(
@@ -311,7 +320,10 @@ class Runtime:
                     )
                     if not task["owner"].startswith("agent:"):
                         self.service.emit(
-                            c, "baltic.guide.messages.v1", tid, {**answer, "guide_id": task["owner"]}
+                            c,
+                            "observatory.observer.messages.v1",
+                            tid,
+                            {**answer, "observer_id": task["owner"]},
                         )
             else:
                 for proposal in result["proposals"]:
@@ -346,7 +358,7 @@ class Runtime:
             )
             if dead:
                 self.service.emit(
-                    c, "baltic.deadletter.v1", job["id"], {"job": job, "error": str(exc)[:1000]}
+                    c, "observatory.deadletter.v1", job["id"], {"job": job, "error": str(exc)[:1000]}
                 )
                 if job["kind"] == "task":
                     c.execute(
@@ -360,7 +372,7 @@ class Runtime:
         if not claim:
             return False
         job, token = claim
-        level = AGENTS[job["agent_id"]].level
+        level = self.service.agent(job["agent_id"]).level
         LATENCY.observe(max(0, time.time() - job["created_at"]))
         renewing = asyncio.create_task(self.renew(job["agent_id"], token))
         start = time.time()
@@ -499,38 +511,20 @@ class Runtime:
         with self.db.tx() as c:
             due = c.execute(select(agents).where(agents.c.next_tick <= now)).mappings().all()
             for a in due:
-                level = AGENTS[a["id"]].level
-                interval = {"city": 900, "country": 1800, "baltic": 3600}[level]
+                level = self.service.agent(a["id"]).level
+                interval = {
+                    "instrument": 300,
+                    "family": 600,
+                    "coordinator": 900,
+                    "circulars": 300,
+                    "case": 1800,
+                }[level]
                 if c.execute(
                     update(agents)
                     .where(agents.c.id == a["id"], agents.c.next_tick <= now)
                     .values(next_tick=now + interval, last_heartbeat=now)
                 ).rowcount:
                     self.service.enqueue(c, a["id"], "heartbeat", {}, digest(a["id"], int(now // interval)))
-            # Expiration runs through the same versioned observation path as publisher corrections.
-            from .schemas import Observation
-
-            for r in c.execute(select(facts)).mappings():
-                p = r["payload"]
-                if (
-                    p["status"] not in {"expired", "cancelled"}
-                    and p["ends_at"]
-                    and stamp_safe(p["ends_at"]) < now
-                ):
-                    body = {
-                        **p,
-                        "status": "expired",
-                        "updated_at": datetime_iso(now),
-                        "observed_at": datetime_iso(now),
-                    }
-                    obs = Observation.model_validate(body)
-                    self.service.emit(
-                        c,
-                        "baltic.ingest.raw.v1",
-                        obs.source_id,
-                        obs.model_dump(mode="json"),
-                        digest("expire", r["id"], r["version"]),
-                    )
 
     async def tick_loop(self):
         while self.running:
@@ -542,7 +536,7 @@ class Runtime:
             await asyncio.sleep(30)
 
     async def drain(self, limit=1000):
-        """Deterministic local pump used by demo CLI and acceptance tests."""
+        """Durable local transport pump for acceptance tests."""
         self.setup_graphs()
         if self.settings.transport != "local":
             raise ValueError("drain is for local transport only")
@@ -558,9 +552,3 @@ def datetime_iso(timestamp):
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(timestamp, UTC).isoformat()
-
-
-def stamp_safe(value):
-    from .service import stamp
-
-    return stamp(value)

@@ -1,92 +1,70 @@
-"""Real Kafka + PostgreSQL acceptance test. Enabled by TEST_DATABASE_URL and TEST_KAFKA_BOOTSTRAP."""
+"""Disposable, real Kafka + PostgreSQL test used by CI, never against a production database."""
 
 import asyncio
 import os
-from datetime import UTC, datetime, timedelta
+import time
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.engine import make_url
 
-from baltic.db import Database, facts, notifications, metadata
-from baltic.runtime import Runtime
-from baltic.schemas import Observation
-from baltic.service import Service
-from baltic.settings import Settings
+from observatory.db import Database, facts, metadata, notifications
+from observatory.runtime import Runtime
+from observatory.service import Service
+from observatory.settings import Settings
+from conftest import accept, lvk
 
 
 @pytest.mark.asyncio
-async def test_real_kafka_postgres_delivery_restart_and_cancellation(tmp_path):
-    url = os.getenv("TEST_DATABASE_URL")
-    broker = os.getenv("TEST_KAFKA_BOOTSTRAP")
+async def test_real_kafka_postgres_delivery_restart_retraction():
+    url, broker = os.getenv("TEST_DATABASE_URL"), os.getenv("TEST_KAFKA_BOOTSTRAP")
     if not url or not broker:
-        pytest.skip("Set TEST_DATABASE_URL and TEST_KAFKA_BOOTSTRAP for integration test")
-    from sqlalchemy.engine import make_url
-
-    if "test" not in (make_url(url).database or ""):
-        pytest.fail("Integration tests require a disposable database with test in its name")
-    cfg = Settings(
+        pytest.skip("Requires disposable PostgreSQL and Kafka; runs in CI")
+    assert "test" in (make_url(url).database or ""), "Refusing a non-test database"
+    settings = Settings(
         database_url=url,
-        transport="kafka",
         kafka_bootstrap=broker,
-        embedded_runtime=False,
-        sources_file="missing.yaml",
-        demo_mode=True,
+        transport="kafka",
         workers=3,
+        admin_token="test-only-integration-token-24-characters",
+        model="",
+        model_api_key="",
+        kafka_group="observatory-test-" + uuid4().hex,
     )
-    cfg.kafka_group = "baltic-test-" + uuid4().hex
     db = Database(url)
     metadata.drop_all(db.engine)
-    service = Service(db, cfg)
+    service = Service(db, settings)
     service.bootstrap()
-    runtime = Runtime(service)
-    uid = uuid4().hex
-    start = datetime.now(UTC) + timedelta(days=2)
-    observation = Observation(
-        source_id="integration",
-        source_item_id=uid,
-        entity_id=uid,
-        country="lv",
-        city_ids=["lv:riga"],
-        kind="event",
-        title="Integration event",
-        source_url="https://example.org/" + uid,
-        starts_at=start,
-        ends_at=start + timedelta(days=1),
-        status="scheduled",
-        authoritative=True,
-    )
 
-    async def until(predicate, seconds=45):
-        deadline = asyncio.get_running_loop().time() + seconds
-        while asyncio.get_running_loop().time() < deadline:
+    async def until(predicate):
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
             if predicate():
                 return
-            await asyncio.sleep(0.2)
-        pytest.fail("Timed out waiting for durable delivery")
+            await asyncio.sleep(0.1)
+        pytest.fail("Timed out waiting for durable Kafka delivery")
 
+    runtime = Runtime(service)
     await runtime.start()
     try:
-        service.ingest(observation)
-        await until(lambda: any(n["payload"].get("entity_ids") == [uid] for n in db.rows(notifications)))
-        first = [n for n in db.rows(notifications) if n["payload"].get("entity_ids") == [uid]]
-        assert len(first) == 1
+        accept(service, lvk())
+        await until(
+            lambda: any(n["payload"].get("case_id") == "lvk:S260923abc" for n in db.rows(notifications))
+        )
     finally:
         await runtime.stop()
     replacement = Runtime(service)
     await replacement.start()
     try:
-        service.ingest(observation)
-        service.ingest(
-            observation.model_copy(update={"status": "cancelled", "updated_at": datetime.now(UTC)})
-        )
+        accept(service, lvk(), 1)
+        accept(service, lvk(kind="RETRACTION", time="2026-09-23T12:01:00Z"), 2)
         await until(
             lambda: any(
-                n["payload"].get("entity_ids") == [uid] and n["payload"]["status"] == "retracted"
+                n["payload"].get("case_id") == "lvk:S260923abc" and n["payload"]["status"] == "retracted"
                 for n in db.rows(notifications)
             )
         )
-        assert db.one(facts, uid)["version"] == 2
-        assert len([n for n in db.rows(notifications) if n["payload"].get("entity_ids") == [uid]]) == 2
+        assert db.rows(facts)[0]["version"] == 2
     finally:
         await replacement.stop()
         db.engine.dispose()

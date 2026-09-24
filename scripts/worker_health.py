@@ -1,12 +1,13 @@
+import sys
 import time
-from sqlalchemy import select
-from baltic.db import Database, runtime_health
-from baltic.settings import Settings
+
+from observatory.db import Database, runtime_health
+from observatory.settings import Settings
 
 db = Database(Settings().database_url)
-with db.engine.connect() as connection:
-    records = connection.execute(
-        select(runtime_health).where(runtime_health.c.updated_at > time.time() - 90)
-    ).mappings()
-    if not any(":worker:" in r["id"] for r in records):
-        raise SystemExit(1)
+rows = db.rows(runtime_health, runtime_health.c.updated_at > time.time() - 90)
+if sys.argv[-1] == "gcn":
+    ok = any(r["id"] == "gcn" and r["payload"]["state"] == "connected" for r in rows)
+else:
+    ok = any(":worker:" in r["id"] for r in rows)
+raise SystemExit(0 if ok else 1)

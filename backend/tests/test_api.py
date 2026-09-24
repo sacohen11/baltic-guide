@@ -1,129 +1,148 @@
 import asyncio
+import time
 
+import pytest
 from fastapi.testclient import TestClient
-from a2a.types import a2a_pb2 as pb
-from google.protobuf.json_format import MessageToDict, ParseDict
 
-from baltic.api import make_app
-from baltic.settings import Settings
-from baltic.db import tasks
+from observatory.api import make_app
+from observatory.db import tasks
 
 
-def app_for(tmp_path, **kwargs):
-    return make_app(
-        Settings(
-            database_url=f"sqlite:///{tmp_path}/api.db",
-            embedded_runtime=False,
-            checkpoint_dir=str(tmp_path / "checkpoints"),
-            sources_file="missing.yaml",
-            **kwargs,
-        )
+@pytest.fixture
+def app(service):
+    return make_app(service.settings)
+
+
+def headers(app):
+    return {"Authorization": "Bearer " + app.state.service.settings.admin_token}
+
+
+def test_authentication_cors_empty_state_and_no_demo(app):
+    client = TestClient(app)
+    assert client.get("/api/overview").status_code == 401
+    response = client.get("/api/overview", headers=headers(app))
+    assert response.status_code == 200
+    assert response.json()["reports"] == 0
+    assert response.json()["agents"] == 12
+    assert client.get("/readyz").status_code == 503
+    assert client.post("/api/demo/seed", headers=headers(app)).status_code == 404
+    response = client.options(
+        "/api/overview",
+        headers={
+            "Origin": "https://sacohen11.github.io",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://sacohen11.github.io"
+    response = client.options(
+        "/api/overview",
+        headers={"Origin": "https://untrusted.invalid", "Access-Control-Request-Method": "GET"},
+    )
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_observer_tokens_are_hashed_and_task_ownership_enforced(app):
+    client = TestClient(app)
+    created = client.post("/api/observers", headers=headers(app), json={"name": "Researcher"})
+    assert created.status_code == 201
+    observer = {"Authorization": "Bearer " + created.json()["token"]}
+    assert client.get("/api/overview", headers=observer).json()["role"] == "observer"
+    assert client.post("/api/observers", headers=observer, json={"name": "Other"}).status_code == 403
+    assert client.get("/api/deadletters", headers=observer).status_code == 403
+    task = client.post("/api/tasks", headers=headers(app), json={"message": "Review the sky"}).json()
+    assert client.get("/api/tasks/" + task["id"], headers=observer).status_code == 404
+    assert client.post("/api/tasks/" + task["id"] + "/cancel", headers=observer).status_code == 404
+
+
+def test_a2a_card_declares_protocol_and_security(app):
+    client = TestClient(app)
+    result = client.get("/a2a/sky/.well-known/agent-card.json", headers=headers(app))
+    assert result.status_code == 200
+    assert result.json()["supportedInterfaces"][0]["protocolVersion"] == "1.0"
+    assert "bearer" in result.json()["securitySchemes"]
+
+
+@pytest.mark.asyncio
+async def test_query_delegation_finishes_durably(app):
+    client = TestClient(app)
+    response = client.post(
+        "/api/tasks",
+        headers=headers(app),
+        json={
+            "message": "Review gravity evidence",
+            "verify": True,
+            "families": ["gravity"],
+            "request_id": "verify-once",
+        },
+    )
+    assert response.status_code == 202
+    tid = response.json()["id"]
+    runtime = app.state.runtime
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            await runtime.drain()
+            if app.state.service.db.one(tasks, tid)["state"] == "completed":
+                break
+            await asyncio.sleep(0.1)
+        result = client.get("/api/tasks/" + tid, headers=headers(app)).json()
+        assert result["state"] == "completed"
+        assert result["result"]["delegated_tasks"]
+        assert result["result"]["child_results"]
+        assert not app.state.service.db.rows(tasks, tasks.c.state.in_(["working", "submitted"]))
+    finally:
+        runtime.stack.close()
+
+
+def test_preferences_validation(app):
+    client = TestClient(app)
+    assert (
+        client.put("/api/preferences", headers=headers(app), json={"families": ["not-real"]}).status_code
+        == 422
+    )
+    assert (
+        client.put("/api/preferences", headers=headers(app), json={"instruments": ["not-real"]}).status_code
+        == 422
+    )
+    assert (
+        client.put(
+            "/api/preferences",
+            headers=headers(app),
+            json={"families": ["gravity"], "multi_messenger_only": True},
+        ).status_code
+        == 200
     )
 
 
-def test_api_demo_query_and_actions(tmp_path):
-    app = app_for(tmp_path)
-    with TestClient(app) as c:
-        assert len(c.get("/api/agents").json()) == 34
-        assert c.post("/api/demo/seed").status_code == 200
-        asyncio.run(app.state.runtime.drain())
-        messages = c.get("/api/messages?limit=500").json()
-        assert len(messages) >= 10
-        assert any(m["payload"]["type"] == "theme" for m in messages)
-        mid = messages[0]["id"]
-        assert c.post(f"/api/messages/{mid}/actions", json={"action": "save_to_trip"}).status_code == 200
-        assert c.get("/api/messages").json()[0]["saved"]
-        query = c.post("/api/query", json={"message": "What changed?", "request_id": "unique"})
-        assert query.status_code == 202
-        task_id = query.json()["task_id"]
-        assert (
-            c.post("/api/query", json={"message": "What changed?", "request_id": "unique"}).json()["task_id"]
-            == task_id
-        )
-        asyncio.run(app.state.runtime.drain())
-        assert c.get("/api/tasks/" + task_id).json()["state"] == "completed"
-
-
-def test_auth_and_tenant_isolation(tmp_path):
-    token = "test-admin-token-long-enough-for-validation"
-    app = app_for(tmp_path, demo_mode=False, admin_token=token)
-    with TestClient(app) as c:
-        assert c.get("/api/messages").status_code == 401
-        h = {"Authorization": "Bearer " + token}
-        g1 = c.post("/api/guides", headers=h, json={"name": "One"}).json()
-        g2 = c.post("/api/guides", headers=h, json={"name": "Two"}).json()
-        h1 = {"Authorization": "Bearer " + g1["token"]}
-        h2 = {"Authorization": "Bearer " + g2["token"]}
-        tid = c.post("/api/query", headers=h1, json={"message": "Hello"}).json()["task_id"]
-        assert c.get("/api/tasks/" + tid, headers=h2).status_code == 404
-        assert c.post("/api/demo/seed", headers=h1).status_code == 403
-        assert c.post("/api/demo/seed", headers=h).status_code == 403
-        assert c.get("/api/admin/deadletters", headers=h1).status_code == 403
-        assert c.get("/metrics", headers=h1).status_code == 403
-
-
-def test_a2a_sdk_jsonrpc_roundtrip_and_card(tmp_path):
-    app = app_for(tmp_path)
-    with TestClient(app) as c:
-        base = "/a2a/city:lv:riga"
-        card = c.get(base + "/.well-known/agent-card.json")
-        assert card.status_code == 200
-        parsed_card = ParseDict(card.json(), pb.AgentCard())
-        assert parsed_card.name == "Rīga" and parsed_card.capabilities.streaming
-        req = pb.SendMessageRequest(
-            message=pb.Message(
-                message_id="sdk-msg-1", role=pb.ROLE_USER, parts=[pb.Part(text="What is happening?")]
-            ),
-            configuration=pb.SendMessageConfiguration(return_immediately=True),
-        )
-        headers = {"A2A-Version": "1.0"}
-        response = c.post(
-            base + "/",
-            headers=headers,
-            json={"jsonrpc": "2.0", "id": "1", "method": "SendMessage", "params": MessageToDict(req)},
-        )
-        assert response.status_code == 200, response.text
-        data = response.json()
-        assert "error" not in data, data
-        # SDK's 1.0 SendMessage returns a response envelope containing a task.
-        task = data["result"].get("task", data["result"])
-        task_id = task["id"]
-        asyncio.run(app.state.runtime.drain())
-        response = c.post(
-            base + "/",
-            headers=headers,
-            json={"jsonrpc": "2.0", "id": "2", "method": "GetTask", "params": {"id": task_id}},
-        )
-        assert "error" not in response.json(), response.text
-        task = ParseDict(response.json()["result"], pb.Task())
-        assert task.status.state == pb.TASK_STATE_COMPLETED
-        assert len(task.artifacts) == 1
-
-
-def test_delegated_verification_finishes(tmp_path):
-    app = app_for(tmp_path)
-    with TestClient(app) as c:
-        result = c.post(
-            "/api/query",
-            json={
-                "message": "Check the stored evidence",
-                "verify": True,
-                "city_ids": ["lv:riga", "ee:tallinn"],
+def test_a2a_send_message_and_cancel_descendants(app):
+    client = TestClient(app)
+    response = client.post(
+        "/a2a/sky/",
+        headers={**headers(app), "A2A-Version": "1.0"},
+        json={
+            "jsonrpc": "2.0",
+            "id": "rpc-1",
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "a2a-request-1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "Review current evidence"}],
+                },
+                "configuration": {"returnImmediately": True},
             },
-        )
-        assert result.status_code == 202, result.text
-        tid = result.json()["task_id"]
-        # Parent may yield until child tasks finish; advance availability in this deterministic test.
-        from sqlalchemy import update
-        from baltic.db import inbox
-
-        for _ in range(15):
-            asyncio.run(app.state.runtime.drain())
-            with app.state.service.db.tx() as conn:
-                conn.execute(update(inbox).values(available_at=0))
-            if c.get("/api/tasks/" + tid).json()["state"] == "completed":
-                break
-        assert c.get("/api/tasks/" + tid).json()["state"] == "completed"
-        rows = app.state.service.db.rows(tasks)
-        assert len(rows) == 5
-        assert all(t["state"] == "completed" for t in rows)
+        },
+    )
+    assert response.status_code == 200
+    assert "error" not in response.json(), response.json()
+    created = client.post(
+        "/api/tasks", headers=headers(app), json={"message": "Delegate this review", "verify": True}
+    ).json()
+    assert (
+        client.post("/api/tasks/" + created["id"] + "/cancel", headers=headers(app)).json()["state"]
+        == "canceled"
+    )
+    children = app.state.service.db.rows(tasks, tasks.c.parent_task_id == created["id"])
+    assert children and all(t["state"] == "canceled" for t in children)

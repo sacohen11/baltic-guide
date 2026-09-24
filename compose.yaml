@@ -1,16 +1,14 @@
-# Complete Kafka/Postgres deployment for a single host. Keep host ports private.
-# Replace the single broker/database with managed replicated services for high availability.
+# Always-on backend. GCN is the external input broker; Kafka below is internal routing.
 x-app: &app
   build: .
-  image: baltic-guide:local
+  image: space-observatory:local
   env_file: .env
   environment: &env
-    DATABASE_URL: postgresql+psycopg://baltic:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/baltic
+    DATABASE_URL: postgresql+psycopg://observatory:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/observatory
     TRANSPORT: kafka
     KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     KAFKA_REPLICATION_FACTOR: "1"
-    DEMO_MODE: "false"
-    ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env}
+    ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN}
     EMBEDDED_RUNTIME: "false"
   restart: unless-stopped
   depends_on:
@@ -20,12 +18,12 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: baltic
-      POSTGRES_USER: baltic
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    volumes: ["postgres-data:/var/lib/postgresql/data"]
+      POSTGRES_DB: observatory
+      POSTGRES_USER: observatory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: ["observatory-postgres:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U baltic -d baltic"]
+      test: ["CMD-SHELL", "pg_isready -U observatory -d observatory"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -36,9 +34,9 @@ services:
     environment:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:19092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:19092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
@@ -48,8 +46,7 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-    ports: ["127.0.0.1:19092:19092"]
-    volumes: ["kafka-data:/tmp/kraft-combined-logs"]
+    volumes: ["observatory-kafka:/tmp/kraft-combined-logs"]
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
       interval: 10s
@@ -61,17 +58,34 @@ services:
     ports: ["127.0.0.1:8000:8000"]
   worker:
     <<: *app
-    command: ["baltic", "worker"]
+    command: ["observatory", "worker"]
     healthcheck:
-      test: ["CMD", "python", "scripts/worker_health.py"]
+      test: ["CMD", "python", "scripts/worker_health.py", "worker"]
       interval: 30s
       timeout: 10s
       retries: 3
-  connectors:
+  ingestor:
     <<: *app
-    command: ["baltic", "connectors"]
-    profiles: ["live"]
-    healthcheck: {disable: true}
+    command: ["observatory", "ingest"]
+    environment:
+      <<: *env
+      GCN_CLIENT_ID: ${GCN_CLIENT_ID:?Set GCN_CLIENT_ID from gcn.nasa.gov}
+      GCN_CLIENT_SECRET: ${GCN_CLIENT_SECRET:?Set GCN_CLIENT_SECRET from gcn.nasa.gov}
+    healthcheck:
+      test: ["CMD", "python", "scripts/worker_health.py", "gcn"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    environment:
+      OBSERVATORY_DOMAIN: ${OBSERVATORY_DOMAIN:-localhost}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes: ["./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "observatory-caddy:/data"]
+    depends_on: [api]
+    restart: unless-stopped
 volumes:
-  postgres-data:
-  kafka-data:
+  observatory-postgres:
+  observatory-kafka:
+  observatory-caddy:

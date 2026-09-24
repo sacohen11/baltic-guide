@@ -3,6 +3,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Column,
     Float,
@@ -20,7 +21,7 @@ from sqlalchemy.pool import StaticPool
 
 metadata = MetaData()
 agents = Table(
-    "agents",
+    "obs_agents",
     metadata,
     Column("id", String(100), primary_key=True),
     Column("definition", JSON, nullable=False),
@@ -34,7 +35,7 @@ agents = Table(
     Column("runs", Integer, default=0),
 )
 inbox = Table(
-    "inbox",
+    "obs_inbox",
     metadata,
     Column("id", String(80), primary_key=True),
     Column("agent_id", String(100), nullable=False, index=True),
@@ -48,9 +49,9 @@ inbox = Table(
     Column("error", Text),
     Column("checkpoint", JSON),
 )
-Index("inbox_runnable", inbox.c.state, inbox.c.available_at, inbox.c.agent_id)
+Index("obs_inbox_runnable", inbox.c.state, inbox.c.available_at, inbox.c.agent_id)
 outbox = Table(
-    "outbox",
+    "obs_outbox",
     metadata,
     Column("id", String(80), primary_key=True),
     Column("topic", String(200), nullable=False),
@@ -64,7 +65,7 @@ outbox = Table(
     Column("error", Text),
 )
 evidence = Table(
-    "evidence",
+    "obs_evidence",
     metadata,
     Column("id", String(80), primary_key=True),
     Column("entity_id", String(80), index=True),
@@ -74,9 +75,12 @@ evidence = Table(
     Column("created_at", Float, default=time.time),
 )
 facts = Table(
-    "facts",
+    "obs_facts",
     metadata,
     Column("id", String(128), primary_key=True),
+    Column("agent_id", String(100), nullable=False, index=True),
+    Column("family", String(40), index=True),
+    Column("test", Boolean, nullable=False, default=False, index=True),
     Column("version", Integer, nullable=False),
     Column("content_hash", String(80)),
     Column("payload", JSON, nullable=False),
@@ -86,7 +90,7 @@ facts = Table(
     Column("conflict", Boolean, default=False),
 )
 findings = Table(
-    "findings",
+    "obs_findings",
     metadata,
     Column("id", String(128), primary_key=True),
     Column("agent_id", String(100), index=True),
@@ -95,8 +99,8 @@ findings = Table(
     Column("payload", JSON, nullable=False),
     Column("updated_at", Float, default=time.time),
 )
-guides = Table(
-    "guides",
+observers = Table(
+    "obs_observers",
     metadata,
     Column("id", String(100), primary_key=True),
     Column("name", String(200)),
@@ -104,11 +108,11 @@ guides = Table(
     Column("preferences", JSON, default=dict),
 )
 notifications = Table(
-    "notifications",
+    "obs_notifications",
     metadata,
     Column("seq", Integer, primary_key=True, autoincrement=True),
     Column("id", String(80), unique=True, nullable=False),
-    Column("guide_id", String(100), index=True),
+    Column("observer_id", String(100), index=True),
     Column("finding_id", String(128)),
     Column("version", Integer),
     Column("payload", JSON, nullable=False),
@@ -117,7 +121,7 @@ notifications = Table(
     Column("created_at", Float, default=time.time),
 )
 tasks = Table(
-    "tasks",
+    "obs_tasks",
     metadata,
     Column("id", String(80), primary_key=True),
     Column("request_key", String(80), unique=True),
@@ -133,7 +137,7 @@ tasks = Table(
     Column("error", Text),
 )
 sources = Table(
-    "sources",
+    "obs_sources",
     metadata,
     Column("id", String(120), primary_key=True),
     Column("definition", JSON),
@@ -147,7 +151,7 @@ sources = Table(
     Column("failures", Integer, default=0),
 )
 deadletters = Table(
-    "deadletters",
+    "obs_deadletters",
     metadata,
     Column("id", String(80), primary_key=True),
     Column("payload", JSON),
@@ -155,16 +159,19 @@ deadletters = Table(
     Column("created_at", Float, default=time.time),
 )
 runtime_health = Table(
-    "runtime_health",
+    "obs_runtime_health",
     metadata,
     Column("id", String(100), primary_key=True),
     Column("updated_at", Float),
     Column("payload", JSON),
 )
 model_usage = Table(
-    "model_usage", metadata, Column("day", String(20), primary_key=True), Column("tokens", Integer, default=0)
+    "obs_model_usage",
+    metadata,
+    Column("day", String(20), primary_key=True),
+    Column("tokens", Integer, default=0),
 )
-schema_versions = Table("schema_versions", metadata, Column("version", Integer, primary_key=True))
+schema_versions = Table("obs_schema_versions", metadata, Column("version", Integer, primary_key=True))
 
 
 class Database:
@@ -221,10 +228,39 @@ class Database:
 
 
 source_items = Table(
-    "source_items",
+    "obs_source_items",
     metadata,
     Column("id", String(80), primary_key=True),
     Column("entity_id", String(128)),
     Column("content_hash", String(80)),
     Column("source_time", Float, default=0),
+)
+
+raw_records = Table(
+    "obs_raw_records",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("topic", String(200), nullable=False),
+    Column("partition", Integer, nullable=False),
+    Column("offset", BigInteger, nullable=False),
+    Column("payload", Text, nullable=False),
+    Column("original_base64", Text, nullable=False),
+    Column("state", String(30), nullable=False),
+    Column("error", Text),
+    Column("created_at", Float, default=time.time),
+)
+cases = Table(
+    "obs_cases",
+    metadata,
+    Column("id", String(128), primary_key=True),
+    Column("name", String(200), nullable=False),
+    Column("agent_id", String(100), nullable=False),
+    Column("updated_at", Float, default=time.time),
+)
+case_links = Table(
+    "obs_case_links",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("case_id", String(128), nullable=False, index=True),
+    Column("entity_id", String(128), nullable=False, index=True),
 )

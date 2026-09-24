@@ -1,153 +1,249 @@
-import React, { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
-  ArrowDown,
   ArrowRight,
   Bell,
-  BookOpen,
+  Bookmark,
   Check,
-  CheckCheck,
   ChevronRight,
   CircleDot,
-  Compass,
   ExternalLink,
-  Globe2,
   Layers3,
-  Loader2,
-  MapPin,
-  MessageSquare,
-  Network,
-  Plus,
+  LogOut,
   Radio,
   RefreshCw,
   Search,
   Send,
   Settings2,
-  ShieldCheck,
-  SlidersHorizontal,
   Sparkles,
-  TriangleAlert,
+  Telescope,
+  Waypoints,
   X,
 } from "lucide-react";
-import {
-  api,
-  watchMessages,
-  type Agent,
-  type Card,
-  type Source,
-  type Overview,
-  type Preferences,
-  type Task,
+import { api, defaultBackend, safeUrl, validateBackend, watch } from "./api";
+import type {
+  Agent,
+  Briefing,
+  Card,
+  Case,
+  CaseDetail,
+  Overview,
+  Preferences,
+  Source,
+  Task,
 } from "./api";
-import "./styles.css";
 
-const countries: Record<string, { name: string; color: string; flag: string }> =
-  {
-    ee: { name: "Estonia", color: "#568bba", flag: "🇪🇪" },
-    lv: { name: "Latvia", color: "#a75761", flag: "🇱🇻" },
-    lt: { name: "Lithuania", color: "#a99145", flag: "🇱🇹" },
-  };
-const timeAgo = (n: number) =>
-  !n
-    ? "Never checked"
-    : new Intl.RelativeTimeFormat("en", { numeric: "auto" }).format(
-        -Math.max(0, Math.floor((Date.now() / 1000 - n) / 60)),
-        "minute",
-      );
-const dateLabel = (s?: string | null) =>
-  s
-    ? new Date(s).toLocaleDateString("en", { month: "short", day: "numeric" })
-    : "Date unconfirmed";
-const cityLabel = (id: string) =>
-  id.split(":").pop()?.replaceAll("-", " ") || id;
-function IconMark() {
+const familyNames: Record<string, string> = {
+  light: "Electromagnetic",
+  gravity: "Gravitational waves",
+  neutrino: "Neutrinos",
+};
+const date = (value?: number | string) =>
+  value
+    ? new Date(
+        typeof value === "number" ? value * 1000 : value,
+      ).toLocaleString()
+    : "No observations yet";
+type Tab = "briefing" | "cases" | "agents" | "sources" | "subscriptions";
+
+function Empty({ title, text }: { title: string; text: string }) {
   return (
-    <div className="brand-mark">
-      <Compass size={26} />
+    <div className="empty">
+      <CircleDot size={32} />
+      <h3>{title}</h3>
+      <p>{text}</p>
     </div>
+  );
+}
+function Tags({ values }: { values: string[] }) {
+  return (
+    <div className="tags">
+      {values.map((v) => (
+        <span key={v} className={"tag " + v}>
+          {familyNames[v] || v}
+        </span>
+      ))}
+    </div>
+  );
+}
+function Brief({
+  value,
+  openCase,
+}: {
+  value: Briefing;
+  openCase: (id: string) => void;
+}) {
+  return (
+    <>
+      <div className="card-meta">
+        <span className={"status " + value.status}>{value.status}</span>
+        <span>
+          {value.type === "case" ? "EVENT CASE" : "AGENT BRIEFING"}{" "}
+          {value.version ? `· REV ${value.version}` : ""}
+        </span>
+      </div>
+      <h3>{value.title}</h3>
+      <p>{value.summary}</p>
+      <Tags values={value.families} />
+      {value.interpretation && (
+        <div className="interpretation">
+          <span>
+            <Sparkles size={13} /> Agent interpretation
+          </span>
+          <p>{value.interpretation}</p>
+        </div>
+      )}
+      <p className="uncertainty">{value.uncertainty}</p>
+      <div className="card-bottom">
+        <span>{value.evidence_ids.length} evidence records</span>
+        {value.case_id && (
+          <button
+            className="text-button"
+            onClick={() => openCase(value.case_id!)}
+          >
+            Open case <ArrowRight size={14} />
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 
 export default function App() {
-  const [tab, setTab] = useState("briefing");
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [cards, setCards] = useState<Card[]>([]);
-  const [sources, setSources] = useState<Source[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [prefs, setPrefs] = useState<Preferences | null>(null);
-  const [country, setCountry] = useState("all");
-  const [kind, setKind] = useState("all");
-  const [search, setSearch] = useState("");
-  const [question, setQuestion] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
-  const [error, setError] = useState("");
-  const [selected, setSelected] = useState<Agent | null>(null);
-  const [access, setAccess] = useState("");
-  const [login, setLogin] = useState(false);
-  const [verify, setVerify] = useState(false);
-  const [savedOnly, setSavedOnly] = useState(false);
-  const merge = (incoming: Card[]) =>
-    setCards((previous) => {
-      const map = new Map(previous.map((x) => [x.id, x]));
-      incoming.forEach((x) => map.set(x.id, x));
-      const latest = new Map<string, number>();
-      for (const x of map.values())
-        latest.set(
-          x.finding_id,
-          Math.max(latest.get(x.finding_id) || 0, x.version),
-        );
-      return [...map.values()]
-        .filter((x) => x.version === latest.get(x.finding_id))
-        .sort((a, b) => b.seq - a.seq);
+  const [base, setBase] = useState(defaultBackend),
+    [token, setToken] = useState(
+      () => sessionStorage.getItem("observatory-token") || "",
+    );
+  const [connected, setConnected] = useState(false),
+    [connecting, setConnecting] = useState(false);
+  const [tab, setTab] = useState<Tab>("briefing"),
+    [error, setError] = useState(""),
+    [notice, setNotice] = useState("");
+  const [overview, setOverview] = useState<Overview | null>(null),
+    [agents, setAgents] = useState<Agent[]>([]);
+  const [cases, setCases] = useState<Case[]>([]),
+    [messages, setMessages] = useState<Card[]>([]),
+    [sources, setSources] = useState<Source[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]),
+    [prefs, setPrefs] = useState<Preferences>({
+      families: [],
+      instruments: [],
+      multi_messenger_only: false,
     });
-  async function refresh() {
+  const [selected, setSelected] = useState<Agent | null>(null),
+    [detail, setDetail] = useState<CaseDetail | null>(null);
+  const [question, setQuestion] = useState(""),
+    [verify, setVerify] = useState(true),
+    [busy, setBusy] = useState(false);
+  const [filter, setFilter] = useState("all"),
+    [query, setQuery] = useState(""),
+    [lastSync, setLastSync] = useState<number>();
+  const refreshing = useRef(false);
+  const preferencesDirty = useRef(false);
+  function editPrefs(value: Preferences) {
+    preferencesDirty.current = true;
+    setPrefs(value);
+  }
+  const call = useCallback(
+    <T,>(path: string, options?: RequestInit) =>
+      api<T>(base, token, path, options),
+    [base, token],
+  );
+  const refresh = useCallback(async () => {
+    if (refreshing.current) return;
+    refreshing.current = true;
     try {
-      const [o, a, m, s, t, p] = await Promise.all([
-        api<Overview>("/overview"),
-        api<Agent[]>("/agents"),
-        api<Card[]>("/messages?limit=500"),
-        api<Source[]>("/sources"),
-        api<Task[]>("/tasks"),
-        api<Preferences>("/preferences"),
+      const [o, a, c, m, s, t, p] = await Promise.all([
+        call<Overview>("/overview"),
+        call<Agent[]>("/agents"),
+        call<Case[]>("/cases"),
+        call<Card[]>("/messages"),
+        call<Source[]>("/sources"),
+        call<Task[]>("/tasks"),
+        call<Preferences>("/preferences"),
       ]);
       setOverview(o);
       setAgents(a);
-      merge(m);
+      setCases((previous) => [
+        ...c,
+        ...previous.filter((old) => !c.some((row) => row.id === old.id)),
+      ]);
+      setMessages((previous) => [
+        ...m,
+        ...previous.filter((old) => !m.some((row) => row.id === old.id)),
+      ]);
       setSources(s);
       setTasks(t);
-      setPrefs(p);
+      if (!preferencesDirty.current) setPrefs(p);
       setError("");
-      setLogin(false);
+      setLastSync(Date.now());
     } catch (e) {
-      const msg = (e as Error).message;
-      setError(msg);
-      if (msg.includes("token")) setLogin(true);
+      setError((e as Error).message);
+    } finally {
+      refreshing.current = false;
     }
-  }
+  }, [call]);
   useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, 4000);
+    if (!connected) return;
+    void refresh();
+    const interval = setInterval(() => void refresh(), 10000);
     const abort = new AbortController();
-    watchMessages((card) => merge([card]), abort.signal);
+    void watch(base, token, () => void refresh(), abort.signal);
     return () => {
       clearInterval(interval);
       abort.abort();
     };
-  }, []);
+  }, [connected, refresh, base, token]);
   useEffect(() => {
-    if (notice) {
-      const id = setTimeout(() => setNotice(""), 5000);
-      return () => clearTimeout(id);
-    }
+    if (!notice) return;
+    const id = setTimeout(() => setNotice(""), 4000);
+    return () => clearTimeout(id);
   }, [notice]);
-  async function act(fn: () => Promise<unknown>, success: string) {
+  useEffect(() => {
+    if (!connected || !detail?.id) return;
+    const id = detail.id;
+    const interval = setInterval(() => {
+      void call<CaseDetail>("/cases/" + encodeURIComponent(id))
+        .then(setDetail)
+        .catch((e) => setError(e.message));
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [connected, detail?.id, call]);
+
+  async function connect(event: React.FormEvent) {
+    event.preventDefault();
+    setConnecting(true);
+    setError("");
+    try {
+      const origin = validateBackend(base);
+      const o = await api<Overview>(origin, token, "/overview");
+      localStorage.setItem("observatory-backend", origin);
+      sessionStorage.setItem("observatory-token", token);
+      setBase(origin);
+      setOverview(o);
+      setConnected(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setConnecting(false);
+    }
+  }
+  async function action(fn: () => Promise<unknown>, success = "") {
     setBusy(true);
     try {
       await fn();
-      setNotice(success);
-      await refresh();
+      if (success) setNotice(success);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function openCase(id: string) {
+    setBusy(true);
+    try {
+      setDetail(await call<CaseDetail>("/cases/" + encodeURIComponent(id)));
+      setSelected(null);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -155,1061 +251,930 @@ export default function App() {
     }
   }
   async function ask() {
-    if (!question.trim()) return;
-    const message = question;
-    await act(
-      () =>
-        api("/query", {
-          method: "POST",
-          body: JSON.stringify({
-            message,
-            agent_id: selected?.id || "baltic:coordinator",
-            verify,
-            request_id: crypto.randomUUID(),
-          }),
+    const target = selected?.id || detail?.agent_id || "sky";
+    await action(async () => {
+      await call("/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          agent_id: target,
+          message: question,
+          case_id: detail?.id || null,
+          verify,
+          request_id: crypto.randomUUID(),
         }),
-      "Your request is queued. The answer will appear in your briefing.",
-    );
-    setQuestion("");
+      });
+      setQuestion("");
+      await refresh();
+    }, "Request queued. Results appear in your briefing.");
   }
-  const filtered = useMemo(
-    () =>
-      cards.filter(
-        (c) =>
-          c.status !== "dismissed" &&
-          c.status !== "superseded" &&
-          (country === "all" || c.payload.countries?.includes(country)) &&
-          (kind === "all" || c.payload.type === kind) &&
-          (!savedOnly || c.saved) &&
-          (!search ||
-            `${c.payload.title} ${c.payload.summary}`
-              .toLowerCase()
-              .includes(search.toLowerCase())),
-      ),
-    [cards, country, kind, search, savedOnly],
-  );
-  const activeTasks = tasks.filter((t) =>
-    ["submitted", "working"].includes(t.state),
-  );
-  const visibleAgents = agents.filter(
-    (a) => a.level === "city" && (country === "all" || a.country === country),
-  );
-  const cityName = (id: string) =>
-    agents.find((a) => a.city_id === id)?.name || cityLabel(id);
-  async function cardAction(card: Card, action: string) {
-    await act(
-      () =>
-        api(`/messages/${card.id}/actions`, {
-          method: "POST",
-          body: JSON.stringify({ action }),
-        }),
-      action === "save_to_trip"
-        ? "Trip selection updated"
-        : action === "request_verification"
-          ? "Verification delegated to the relevant agents"
-          : "Briefing updated",
-    );
+  async function loadMore() {
+    if (tab === "cases" && cases.length) {
+      const more = await call<Case[]>(
+        "/cases?before=" + cases[cases.length - 1].updated_at,
+      );
+      setCases((current) => [...current, ...more]);
+    } else if (messages.length) {
+      const more = await call<Card[]>(
+        "/messages?before=" + messages[messages.length - 1].seq,
+      );
+      setMessages((current) => [...current, ...more]);
+    }
   }
 
-  return (
-    <div className="shell">
-      <aside className="sidebar">
-        <a
-          className="brand"
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            setTab("briefing");
-          }}
-        >
-          <IconMark />
-          <div>
-            Baltic<span>GUIDE INTELLIGENCE</span>
-          </div>
-        </a>
-        <div className="workspace">
-          <div className="workspace-avatar">BG</div>
-          <div>
-            My guide workspace<small>Three countries. One perspective.</small>
-          </div>
-        </div>
-        <div className="nav-label">WORKSPACE</div>
-        <nav>
-          {[
-            ["briefing", BookOpen, "Your briefing"],
-            ["network", Network, "Agent network"],
-            ["sources", Radio, "Data sources"],
-            ["settings", SlidersHorizontal, "Trip preferences"],
-          ].map(([id, Icon, label]) => {
-            const I = Icon as typeof BookOpen;
-            return (
-              <button
-                key={id as string}
-                className={tab === id ? "nav-item selected" : "nav-item"}
-                onClick={() => setTab(id as string)}
-              >
-                <I size={19} />
-                <span>{label as string}</span>
-                {id === "briefing" && !!overview?.unread && (
-                  <b>{overview.unread}</b>
-                )}
-              </button>
-            );
-          })}
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="network-status">
-            <span
-              className={
-                overview?.workers_online ? "status-dot" : "status-dot offline"
-              }
-            />
+  if (!connected)
+    return (
+      <div className="connect-page">
+        <div className="connect-orbit" aria-hidden="true" />
+        <header className="brand">
+          <Telescope size={25} />
+          <span>OBSERVATORY</span>
+        </header>
+        <main className="connect-content">
+          <span className="eyebrow">A SHARED VIEW OF THE UNIVERSE</span>
+          <h1>
+            Many instruments.
+            <br />
+            One unfolding story.
+          </h1>
+          <p className="connect-lead">
+            A living network of agents following the sky. Connect to your
+            observatory to explore real GCN alerts, source evidence, and events
+            as they develop.
+          </p>
+          <div className="connect-families">
             <span>
-              {overview?.workers_online
-                ? "Network is listening"
-                : "Waiting for workers"}
-              <small>
-                {overview?.workers_online || 0} workers ·{" "}
-                {overview?.pending || 0} queued
-              </small>
+              <i className="light" /> Light
+            </span>
+            <span>
+              <i className="gravity" /> Gravitational waves
+            </span>
+            <span>
+              <i className="neutrino" /> Neutrinos
             </span>
           </div>
-          <button className="account" onClick={() => setLogin(!login)}>
-            <div className="avatar">SG</div>
-            <div>
-              Tour guide
-              <small>
-                {overview?.demo_mode ? "Demo workspace" : "Connected workspace"}
-              </small>
-            </div>
-            <Settings2 size={17} />
+          <form className="connect-form" onSubmit={connect}>
+            <h2>Connect to your observatory</h2>
+            <label>
+              Backend URL
+              <input
+                type="url"
+                required
+                value={base}
+                onChange={(e) => setBase(e.target.value)}
+                placeholder="https://observatory.example.com"
+              />
+            </label>
+            <label>
+              Access token
+              <input
+                type="password"
+                required
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                placeholder="Your observer or administrator token"
+                autoComplete="off"
+              />
+            </label>
+            {error && (
+              <div role="alert" className="error">
+                {error}
+              </div>
+            )}
+            <button className="primary" disabled={connecting}>
+              {connecting ? "Connecting…" : "Open observatory"}
+              <ArrowRight size={17} />
+            </button>
+            <p>
+              GCN credentials stay on your backend. Your access token is kept
+              only for this browser session.
+            </p>
+          </form>
+          <div className="connect-note">
+            12 permanent agents · Persistent event cases · Source-backed
+            briefings
+          </div>
+        </main>
+      </div>
+    );
+
+  const live =
+    overview?.gcn.state === "connected" &&
+    Boolean(overview?.workers_online) &&
+    !error;
+  const displayed = messages.filter(
+    (m) =>
+      m.status !== "superseded" &&
+      !messages.some(
+        (other) =>
+          other.payload.id === m.payload.id &&
+          (other.payload.version || 0) > (m.payload.version || 0),
+      ) &&
+      (filter === "all" ||
+        (filter === "saved" && m.saved) ||
+        m.payload.families.includes(filter)),
+  );
+  const filteredCases = cases.filter((c) =>
+    c.name.toLowerCase().includes(query.toLowerCase()),
+  );
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <Telescope size={25} />
+          <span>
+            OBSERVATORY<small>MULTI-MESSENGER INTELLIGENCE</small>
+          </span>
+        </div>
+        <div className="workspace-label">YOUR WORKSPACE</div>
+        <nav>
+          {(
+            [
+              ["briefing", "Briefing desk", Bell],
+              ["cases", "Event cases", Layers3],
+              ["agents", "Agent network", Waypoints],
+              ["sources", "Live streams", Radio],
+              ["subscriptions", "Subscriptions", Settings2],
+            ] as const
+          ).map(([id, label, Icon]) => (
+            <button
+              className={tab === id ? "nav-item active" : "nav-item"}
+              key={id}
+              onClick={() => setTab(id)}
+            >
+              <Icon size={18} />
+              {label}
+              {id === "briefing" && Boolean(overview?.unread) && (
+                <b>{overview?.unread}</b>
+              )}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-bottom">
+          <span className={"connection " + (live ? "live" : "")}>
+            <i />
+            {live ? "GCN connected" : "Awaiting live connection"}
+          </span>
+          <p>NASA GCN + participating observatories</p>
+          <button
+            className="text-button"
+            onClick={() => {
+              sessionStorage.removeItem("observatory-token");
+              setConnected(false);
+              setToken("");
+              setError("");
+            }}
+          >
+            <LogOut size={14} /> Disconnect
           </button>
         </div>
       </aside>
-      <main>
-        <header>
-          <div className="breadcrumb">
-            Workspace <ChevronRight size={14} />{" "}
-            <span>
-              {
-                {
-                  briefing: "Your briefing",
-                  network: "Agent network",
-                  sources: "Data sources",
-                  settings: "Trip preferences",
-                }[tab]
-              }
+      <main className="workspace">
+        <header className="topbar">
+          <span>
+            Mission control <ChevronRight size={13} />{" "}
+            {tab === "briefing" ? "Briefing desk" : tab}
+          </span>
+          <div>
+            <span className="utc">
+              {lastSync
+                ? `Synced ${new Date(lastSync).toLocaleTimeString()}`
+                : "Connecting"}
             </span>
-          </div>
-          <div className="header-right">
-            <span className="region-tag">
-              <Globe2 size={15} /> THE BALTICS
-            </span>
-            <button aria-label="Refresh dashboard" onClick={refresh}>
-              <RefreshCw size={17} />
-            </button>
             <button
-              aria-label="Show unread briefing"
-              onClick={() => {
-                setTab("briefing");
-                setKind("all");
-              }}
+              className="icon-button"
+              aria-label="Refresh"
+              onClick={() => void refresh()}
             >
-              <Bell size={18} />
+              <RefreshCw size={16} />
             </button>
+            <span className="avatar">
+              {overview?.role === "admin" ? "OP" : "OB"}
+            </span>
           </div>
         </header>
-        {login && (
-          <div className="login-panel">
-            <ShieldCheck size={22} />
-            <div>
-              <b>Connect your workspace</b>
-              <p>Enter the guide access token issued by your administrator.</p>
-            </div>
-            <input
-              type="password"
-              aria-label="Access token"
-              value={access}
-              onChange={(e) => setAccess(e.target.value)}
-              placeholder="Guide access token"
-            />
-            <button
-              className="primary"
-              onClick={() => {
-                sessionStorage.setItem("baltic-token", access);
-                setAccess("");
-                window.location.reload();
-              }}
-            >
-              Connect
-            </button>
-          </div>
-        )}
-        <div className="content">
+        <div className="workspace-content">
           {error && (
-            <div className="error-banner" role="alert">
-              <TriangleAlert size={18} />
-              {error}
-              <button onClick={() => setError("")} aria-label="Dismiss error">
-                <X size={16} />
-              </button>
+            <div className="error" role="alert">
+              {error} · Last retrieved data remains visible.
             </div>
           )}
-          <div className="page-title">
+          {!live && overview && (
+            <div className="connection-banner">
+              <Radio size={18} />
+              <div>
+                <strong>
+                  {overview.gcn.state === "connected"
+                    ? "Waiting for agent workers"
+                    : "Live ingestion is not connected"}
+                </strong>
+                <p>
+                  {overview.gcn.error ||
+                    `GCN status: ${overview.gcn.state}. Check Live streams for connection details.`}
+                </p>
+              </div>
+            </div>
+          )}
+          <div className="page-heading">
             <div>
-              <div className="eyebrow">LOCAL KNOWLEDGE, CONNECTED</div>
+              <span className="eyebrow">THE UNIVERSE, IN CONTEXT</span>
               <h1>
-                {tab === "briefing"
-                  ? "A wider perspective."
-                  : tab === "network"
-                    ? "Thirty cities. Always listening."
-                    : tab === "sources"
-                      ? "Know where it comes from."
-                      : "Make it relevant to your tour."}
+                {
+                  {
+                    briefing: "Your view of the sky.",
+                    cases: "Follow the whole story.",
+                    agents: "Intelligence, composed.",
+                    sources: "Straight from the source.",
+                    subscriptions: "Keep the signals that matter.",
+                  }[tab]
+                }
               </h1>
               <p>
-                {tab === "briefing"
-                  ? "The changes, connections, and opportunities that matter to your next tour."
-                  : tab === "network"
-                    ? "Independent local agents, working together across the Baltics."
-                    : tab === "sources"
-                      ? "Track source coverage, freshness, and the evidence behind every finding."
-                      : "Tell your agents where you’re going and what your group cares about."}
+                {
+                  {
+                    briefing:
+                      "Instrument alerts become evidence. Agents connect the context.",
+                    cases:
+                      "Every revision, follow-up, and retraction stays with its event.",
+                    agents:
+                      "Specialists report upward. Event cases bring their evidence together.",
+                    sources:
+                      "External Kafka streams from NASA’s General Coordinates Network.",
+                    subscriptions:
+                      "Choose the families and instruments you want in your briefing.",
+                  }[tab]
+                }
               </p>
             </div>
-            {overview?.demo_mode && (
-              <button
-                className="secondary"
-                disabled={busy}
-                onClick={() =>
-                  act(
-                    () => api("/demo/seed", { method: "POST" }),
-                    "Illustrative scenario queued. Agents are processing it.",
-                  )
-                }
-              >
-                <Plus size={16} /> Load demo scenario
-              </button>
-            )}
+            <span className={"live-badge " + (live ? "online" : "")}>
+              <i />
+              {live ? "LIVE OBSERVATORY" : "CONNECTION PENDING"}
+            </span>
           </div>
-          {overview?.demo_mode && (
-            <div className="demo-strip">
-              <Sparkles size={15} />
-              <span>
-                Demo workspace · Illustrative events are clearly marked. No API
-                key is needed to explore.
-              </span>
-              <button
-                onClick={() =>
-                  act(
-                    () => api("/demo/cancel", { method: "POST" }),
-                    "Cancellation queued. Watch the affected findings update.",
-                  )
-                }
-                disabled={busy}
-              >
-                Simulate a cancellation <ArrowRight size={14} />
-              </button>
-            </div>
-          )}
-          <div className="stats-grid">
-            <Stat
-              label="CITY AGENTS"
-              value={overview?.cities ?? "—"}
-              note="Across Estonia, Latvia & Lithuania"
-              icon={<MapPin size={18} />}
-            />
-            <Stat
-              label="SOURCE OBSERVATIONS"
-              value={overview?.facts ?? "—"}
-              note="Deduplicated, with evidence"
-              icon={<Layers3 size={18} />}
-            />
-            <Stat
-              label="YOUR UNREAD UPDATES"
-              value={overview?.unread ?? "—"}
-              note="Matched to your subscriptions"
-              icon={<Bell size={18} />}
-            />
-            <Stat
-              label="NETWORK ACTIVITY"
-              value={overview?.pending ?? "—"}
-              note="Durable tasks in the queue"
-              icon={<Activity size={18} />}
-            />
+          <div className="stats">
+            {[
+              [
+                "EVENT CASES",
+                overview?.cases ?? "—",
+                "Persistent investigations",
+                Layers3,
+              ],
+              [
+                "SOURCE REPORTS",
+                overview?.reports ?? "—",
+                "Current live revisions",
+                Radio,
+              ],
+              [
+                "PERMANENT AGENTS",
+                overview?.agents ?? "—",
+                `${overview?.workers_online || 0} workers online`,
+                Waypoints,
+              ],
+              [
+                "QUEUED WORK",
+                overview?.pending ?? "—",
+                `${overview?.quarantined || 0} quarantined records`,
+                Activity,
+              ],
+            ].map(([label, value, note, Icon]) => {
+              const I = Icon as typeof Activity;
+              return (
+                <div className="stat" key={String(label)}>
+                  <span>
+                    {String(label)}
+                    <I size={16} />
+                  </span>
+                  <strong>{String(value)}</strong>
+                  <p>{String(note)}</p>
+                </div>
+              );
+            })}
           </div>
           {tab === "briefing" && (
-            <div className="briefing-grid">
-              <section className="feed-section">
-                <div className="section-top">
-                  <div>
-                    <h2>
-                      Your live briefing{" "}
-                      <span className="live-indicator">LIVE</span>
-                    </h2>
-                    <p>Evidence first. Useful connections next.</p>
+            <div className="briefing-layout">
+              <section>
+                <div className="section-heading">
+                  <h2>
+                    Latest intelligence <span>{displayed.length}</span>
+                  </h2>
+                  <div className="filter-tabs">
+                    {["all", "light", "gravity", "neutrino", "saved"].map(
+                      (f) => (
+                        <button
+                          key={f}
+                          className={filter === f ? "active" : ""}
+                          onClick={() => setFilter(f)}
+                        >
+                          {
+                            (
+                              {
+                                all: "All signals",
+                                light: "Light",
+                                gravity: "Gravity",
+                                neutrino: "Neutrinos",
+                                saved: "Saved",
+                              } as Record<string, string>
+                            )[f]
+                          }
+                        </button>
+                      ),
+                    )}
                   </div>
-                  <button
-                    className={savedOnly ? "mini active" : "mini"}
-                    onClick={() => setSavedOnly(!savedOnly)}
-                  >
-                    <BookOpen size={15} />
-                    {savedOnly ? "Saved to trip" : "All updates"}
-                  </button>
                 </div>
-                <div className="filters">
-                  <div className="country-tabs">
-                    {["all", "ee", "lv", "lt"].map((c) => (
-                      <button
-                        key={c}
-                        onClick={() => setCountry(c)}
-                        className={country === c ? "active" : ""}
-                      >
-                        {c === "all"
-                          ? "All countries"
-                          : countries[c].flag + " " + countries[c].name}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="filter-row">
-                    <label className="search">
-                      <Search size={16} />
-                      <input
-                        aria-label="Search briefing"
-                        placeholder="Search your briefing…"
-                        value={search}
-                        onChange={(e) => setSearch(e.target.value)}
-                      />
-                    </label>
-                    <select
-                      aria-label="Finding type"
-                      value={kind}
-                      onChange={(e) => setKind(e.target.value)}
+                {!displayed.length && (
+                  <Empty
+                    title="Listening for the next story"
+                    text="Briefings will appear when live source messages have been received and processed. No example events are loaded."
+                  />
+                )}
+                <div className="feed">
+                  {displayed.map((card) => (
+                    <article
+                      className={"briefing-card " + card.payload.status}
+                      key={card.id}
                     >
-                      <option value="all">All updates</option>
-                      <option value="theme">Cross-city themes</option>
-                      <option value="opportunity">Opportunities</option>
-                      <option value="disruption">Disruptions</option>
-                      <option value="answer">Agent answers</option>
-                    </select>
-                  </div>
+                      <Brief
+                        value={card.payload}
+                        openCase={(id) => void openCase(id)}
+                      />
+                      <div className="message-actions">
+                        <time>{date(card.created_at)}</time>
+                        <button
+                          aria-label={
+                            card.saved ? "Unsave briefing" : "Save briefing"
+                          }
+                          className={
+                            card.saved ? "icon-button selected" : "icon-button"
+                          }
+                          disabled={busy}
+                          onClick={() =>
+                            void action(async () => {
+                              await call("/messages/" + card.id, {
+                                method: "PATCH",
+                                body: JSON.stringify({ saved: !card.saved }),
+                              });
+                              await refresh();
+                            })
+                          }
+                        >
+                          <Bookmark size={16} />
+                        </button>
+                        <button
+                          className="text-button"
+                          disabled={busy || card.status === "read"}
+                          onClick={() =>
+                            void action(async () => {
+                              await call("/messages/" + card.id, {
+                                method: "PATCH",
+                                body: JSON.stringify({ read: true }),
+                              });
+                              await refresh();
+                            })
+                          }
+                        >
+                          <Check size={14} />
+                          {card.status === "read" ? "Read" : "Mark read"}
+                        </button>
+                      </div>
+                    </article>
+                  ))}
                 </div>
-                <div className="cards">
-                  {filtered.length === 0 ? (
-                    <div className="empty">
-                      <Compass size={38} />
-                      <h3>
-                        {cards.length
-                          ? "No matching updates"
-                          : "Your local knowledge starts here"}
-                      </h3>
-                      <p>
-                        {cards.length
-                          ? "Try another country or filter."
-                          : "Load the illustrative scenario, or enable real sources to see your agents connect the dots."}
-                      </p>
-                    </div>
-                  ) : (
-                    filtered.map((card) => (
-                      <article
-                        key={card.id}
-                        className={`finding-card ${card.payload.type === "theme" ? "theme-card" : ""} ${card.payload.status === "retracted" ? "retracted" : ""}`}
-                      >
-                        <div className="card-meta">
-                          <span className={"type-badge " + card.payload.type}>
-                            {card.payload.type === "theme" ? (
-                              <Network size={13} />
-                            ) : card.payload.type === "disruption" ? (
-                              <TriangleAlert size={13} />
-                            ) : (
-                              <CircleDot size={13} />
-                            )}{" "}
-                            {card.payload.type.replaceAll("_", " ")}
-                          </span>
-                          <span>{timeAgo(card.created_at)}</span>
-                          {card.payload.illustrative && (
-                            <span className="demo-badge">ILLUSTRATIVE</span>
-                          )}
-                        </div>
-                        <h3>{card.payload.title}</h3>
-                        <div className="places">
-                          {card.payload.city_ids.slice(0, 4).map((cid) => (
-                            <span key={cid}>
-                              <MapPin size={12} />
-                              {cityName(cid)}
-                            </span>
-                          ))}
-                          {card.payload.city_ids.length > 4 && (
-                            <span>
-                              +{card.payload.city_ids.length - 4} cities
-                            </span>
-                          )}
-                        </div>
-                        {card.payload.status === "retracted" && (
-                          <div className="retract-banner">
-                            Recommendation withdrawn · Check the updated
-                            evidence
-                          </div>
-                        )}
-                        <p className="summary">{card.payload.summary}</p>
-                        {card.payload.starts_at && (
-                          <div className="dates">
-                            {dateLabel(card.payload.starts_at)} —{" "}
-                            {dateLabel(card.payload.ends_at)}{" "}
-                            <span>· Local times in source</span>
-                          </div>
-                        )}
-                        {card.payload.recommended_action && (
-                          <div className="insight">
-                            <ArrowRight size={15} />
-                            <p>{card.payload.recommended_action}</p>
-                          </div>
-                        )}
-                        <div className="card-evidence">
-                          <span>
-                            <ShieldCheck size={14} />
-                            {card.payload.verification.replaceAll("_", " ")}
-                          </span>
-                          <details>
-                            <summary>
-                              {card.payload.source_urls.length} source
-                              {card.payload.source_urls.length !== 1 ? "s" : ""}
-                            </summary>
-                            {card.payload.source_urls.map((url) => (
-                              <a
-                                key={url}
-                                href={url}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {new URL(url).hostname}
-                                <ExternalLink size={12} />
-                              </a>
-                            ))}
-                          </details>
-                          <span>v{card.version}</span>
-                        </div>
-                        <div className="card-actions">
-                          <button
-                            onClick={() => cardAction(card, "save_to_trip")}
-                          >
-                            <BookOpen size={14} />
-                            {card.saved ? "Saved to trip" : "Save to trip"}
-                          </button>
-                          <button
-                            onClick={() =>
-                              cardAction(card, "request_verification")
-                            }
-                          >
-                            <RefreshCw size={14} />
-                            Verify
-                          </button>
-                          <button
-                            onClick={() => cardAction(card, "acknowledge")}
-                          >
-                            <Check size={14} />
-                            {card.status === "acknowledged"
-                              ? "Acknowledged"
-                              : "Acknowledge"}
-                          </button>
-                          <button
-                            onClick={() => cardAction(card, "dismiss")}
-                            aria-label={"Dismiss " + card.payload.title}
-                          >
-                            <X size={14} />
-                          </button>
-                        </div>
-                      </article>
-                    ))
-                  )}
-                </div>
+                {messages.length >= 50 && (
+                  <button
+                    className="secondary"
+                    onClick={() => void action(loadMore)}
+                  >
+                    Load older briefings
+                  </button>
+                )}
               </section>
-              <aside className="right-column">
+              <aside className="right-rail">
                 <div className="ask-panel">
-                  <div className="coordinator-icon">
-                    <Sparkles size={22} />
+                  <div className="panel-icon">
+                    <Sparkles size={21} />
                   </div>
-                  <span className="eyebrow">YOUR BALTIC COORDINATOR</span>
-                  <h2>Ask the whole network.</h2>
+                  <h2>Ask the whole sky</h2>
                   <p>
-                    One question. Local evidence from the places that matter to
-                    your group.
+                    The coordinator can ask its specialists to review their
+                    stored evidence.
                   </p>
                   <textarea
-                    aria-label="Ask the agents"
+                    aria-label="Question for coordinator"
                     value={question}
                     onChange={(e) => setQuestion(e.target.value)}
-                    placeholder="What changed for my Tallinn–Rīga–Vilnius tour next week?"
+                    placeholder="What changed across the instruments?"
                   />
-                  <label className="check-label">
+                  <label className="checkbox">
                     <input
                       type="checkbox"
                       checked={verify}
                       onChange={(e) => setVerify(e.target.checked)}
                     />{" "}
-                    Ask city agents to verify their evidence
+                    Ask child agents to check
                   </label>
                   <button
                     className="primary"
-                    onClick={ask}
-                    disabled={busy || !question.trim()}
+                    disabled={!question.trim() || busy}
+                    onClick={() => void ask()}
                   >
-                    {busy ? (
-                      <Loader2 size={16} className="spin" />
-                    ) : (
-                      <Send size={16} />
-                    )}{" "}
-                    Ask coordinator
+                    Send request <Send size={15} />
                   </button>
-                  <div className="suggested">
-                    Try a question
-                    <button
-                      onClick={() =>
-                        setQuestion(
-                          "Which cities have events with overlapping dates?",
-                        )
-                      }
-                    >
-                      Find a cross-city theme <ArrowRight size={13} />
-                    </button>
-                    <button
-                      onClick={() =>
-                        setQuestion("What disruptions should I know about?")
-                      }
-                    >
-                      Check travel disruptions <ArrowRight size={13} />
-                    </button>
-                  </div>
+                  <small>
+                    {overview?.model
+                      ? `Reasoning model: ${overview.model}`
+                      : "Evidence mode · configure a model for natural-language analysis"}
+                  </small>
                 </div>
-                <div className="coverage-panel">
-                  <h3>Listening across the Baltics</h3>
-                  {Object.entries(countries).map(([code, c]) => (
-                    <button
-                      className="country-health"
-                      key={code}
-                      onClick={() => {
-                        setCountry(code);
-                        setTab("network");
-                      }}
-                    >
-                      <span>{c.flag}</span>
-                      <div>
-                        <b>{c.name}</b>
-                        <small>
-                          {
-                            agents.filter(
-                              (a) => a.country === code && a.level === "city",
-                            ).length
-                          }{" "}
-                          city agents ·{" "}
-                          {
-                            sources.filter(
-                              (s) =>
-                                s.definition.country === code &&
-                                s.state === "healthy",
-                            ).length
-                          }{" "}
-                          healthy sources
-                        </small>
-                      </div>
-                      <ChevronRight size={15} />
-                    </button>
-                  ))}
-                  <p className="coverage-note">
-                    An idle agent is ready to wake. A quiet feed doesn’t
-                    guarantee complete city coverage.
-                  </p>
-                </div>
-                {activeTasks.length > 0 && (
-                  <div className="task-panel">
-                    <h3>
-                      <Loader2 size={16} className="spin" /> Working on your
-                      requests
-                    </h3>
-                    {activeTasks.map((t) => (
-                      <div key={t.id}>
-                        <p>{t.request.message}</p>
-                        <span>{t.state}</span>
+                <div className="rail-panel">
+                  <h3>Agent requests</h3>
+                  {!tasks.length && (
+                    <p className="muted">
+                      Your agent conversations start here.
+                    </p>
+                  )}
+                  {tasks.slice(0, 6).map((t) => (
+                    <div className="task-item" key={t.id}>
+                      <span className={"status " + t.state}>{t.state}</span>
+                      <p>{t.request.message}</p>
+                      {t.error && <p className="error-text">{t.error}</p>}
+                      {t.result && (
+                        <p>{t.result.interpretation || t.result.summary}</p>
+                      )}
+                      {["submitted", "working"].includes(t.state) && (
                         <button
+                          className="text-button"
                           onClick={() =>
-                            act(
-                              () =>
-                                api(`/tasks/${t.id}/cancel`, {
-                                  method: "POST",
-                                }),
-                              "Request canceled",
-                            )
+                            void action(async () => {
+                              await call(`/tasks/${t.id}/cancel`, {
+                                method: "POST",
+                              });
+                              await refresh();
+                            })
                           }
                         >
-                          Cancel
+                          Cancel request
                         </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="rail-panel quiet">
+                  <h3>Evidence before interpretation</h3>
+                  <p>
+                    A shared event reference connects reports. It does not, by
+                    itself, confirm a shared physical origin.
+                  </p>
+                </div>
               </aside>
             </div>
           )}
-          {tab === "network" && (
-            <section className="network-view">
-              <div
-                className="coordinator-node"
-                onClick={() =>
-                  setSelected(agents.find((a) => a.level === "baltic") || null)
-                }
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) =>
-                  e.key === "Enter" &&
-                  setSelected(agents.find((a) => a.level === "baltic") || null)
-                }
-              >
-                <div className="coordinator-icon">
-                  <Network size={25} />
-                </div>
-                <div>
-                  <span className="eyebrow">CROSS-COUNTRY INTELLIGENCE</span>
-                  <h2>Baltic coordinator</h2>
-                  <p>The common thread between 30 local perspectives.</p>
-                </div>
-                <span className="pill">
-                  {agents.find((a) => a.level === "baltic")?.state || "offline"}
-                </span>
+          {tab === "cases" && (
+            <section className="panel">
+              <div className="section-heading">
+                <h2>Event case files</h2>
+                <label className="search">
+                  <Search size={16} />
+                  <input
+                    aria-label="Search cases"
+                    placeholder="Search event identifier"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                  />
+                </label>
               </div>
-              <div className="tree-line">
-                <ArrowDown size={20} />
+              {!filteredCases.length && (
+                <Empty
+                  title="No matching event cases"
+                  text="Case agents are created automatically when external alerts arrive."
+                />
+              )}
+              <div className="case-grid">
+                {filteredCases.map((c) => (
+                  <button
+                    className="case-card"
+                    key={c.id}
+                    onClick={() => void openCase(c.id)}
+                  >
+                    <div className="card-meta">
+                      <CircleDot size={17} />
+                      <span
+                        className={"status " + (c.briefing?.status || "queued")}
+                      >
+                        {c.briefing?.status || "queued"}
+                      </span>
+                    </div>
+                    <h3>{c.name}</h3>
+                    <p>
+                      {c.briefing?.summary ||
+                        "A case agent is reviewing this source report."}
+                    </p>
+                    <Tags values={c.briefing?.families || []} />
+                    <div className="card-bottom">
+                      <time>{date(c.updated_at)}</time>
+                      <ArrowRight size={16} />
+                    </div>
+                  </button>
+                ))}
               </div>
-              <div className="country-columns">
-                {Object.entries(countries).map(([code, c]) => (
-                  <div className="country-column" key={code}>
+              {cases.length >= 50 && (
+                <button
+                  className="secondary"
+                  onClick={() => void action(loadMore)}
+                >
+                  Load older cases
+                </button>
+              )}
+            </section>
+          )}
+          {tab === "agents" && (
+            <section className="network">
+              <div className="root-agent">
+                <span className="eyebrow">WHOLE-SKY COORDINATOR</span>
+                <button
+                  onClick={() => {
+                    setDetail(null);
+                    setSelected(agents.find((a) => a.id === "sky") || null);
+                  }}
+                >
+                  <Telescope size={29} />
+                  <div>
+                    <h2>One shared perspective</h2>
+                    <p>
+                      Cross-family changes, themes, and evidence-backed answers
+                    </p>
+                  </div>
+                  <ChevronRight />
+                </button>
+              </div>
+              <div className="family-grid">
+                {Object.entries(familyNames).map(([family, label]) => (
+                  <div className={"family-column " + family} key={family}>
                     <button
-                      className="country-node"
+                      className="family-heading"
                       onClick={() =>
                         setSelected(
-                          agents.find((a) => a.id === "country:" + code) ||
+                          agents.find((a) => a.id === "family:" + family) ||
                             null,
                         )
                       }
                     >
-                      <span className="flag">{c.flag}</span>
+                      <i />
                       <div>
-                        <h3>{c.name}</h3>
-                        <small>Country intelligence</small>
+                        <span>SIGNAL FAMILY</span>
+                        <h3>{label}</h3>
                       </div>
                       <ChevronRight size={17} />
                     </button>
-                    <div className="city-grid">
-                      {agents
-                        .filter((a) => a.country === code && a.level === "city")
-                        .map((a) => (
-                          <button
-                            key={a.id}
-                            aria-label={`${a.name}, ${a.memory.fact_count || 0} observations, ${a.state}`}
-                            onClick={() => setSelected(a)}
-                            className={"city-node " + a.state}
-                          >
+                    {agents
+                      .filter(
+                        (a) => a.level === "instrument" && a.family === family,
+                      )
+                      .map((a) => (
+                        <button
+                          className="agent-card"
+                          key={a.id}
+                          onClick={() => setSelected(a)}
+                        >
+                          <div>
                             <span className={"agent-dot " + a.state} />
-                            <span>
-                              {a.name}
-                              <small>
-                                {a.memory.fact_count || 0} observations
-                              </small>
-                            </span>
-                            <span className="city-state">{a.state}</span>
-                          </button>
-                        ))}
-                    </div>
+                            <strong>{a.name}</strong>
+                            <span className="agent-state">{a.state}</span>
+                          </div>
+                          <p>
+                            {a.memory.fact_count || 0} reports · {a.runs} runs
+                          </p>
+                          <small>
+                            {a.pending
+                              ? `${a.pending} jobs waiting`
+                              : "Wakes on incoming evidence"}
+                          </small>
+                        </button>
+                      ))}
                   </div>
                 ))}
               </div>
-              <div className="network-legend">
-                <span>
-                  <i className="agent-dot working" />
-                  Reasoning
-                </span>
-                <span>
-                  <i className="agent-dot idle" />
-                  Idle, listening
-                </span>
-                <span>
-                  <i className="agent-dot queued" />
-                  Queued
-                </span>
-                <span>
-                  <i className="agent-dot offline" />
-                  Worker offline
-                </span>
+              <div className="crosscutting">
+                <button
+                  onClick={() =>
+                    setSelected(
+                      agents.find((a) => a.id === "circulars") || null,
+                    )
+                  }
+                >
+                  <Layers3 size={22} />
+                  <div>
+                    <h3>GCN Circulars agent</h3>
+                    <p>Human-written observations and follow-up bulletins</p>
+                  </div>
+                  <ChevronRight size={18} />
+                </button>
+                <button onClick={() => setTab("cases")}>
+                  <Waypoints size={22} />
+                  <div>
+                    <h3>{overview?.cases || 0} event-case agents</h3>
+                    <p>
+                      Durable case files connecting evidence across branches
+                    </p>
+                  </div>
+                  <ChevronRight size={18} />
+                </button>
               </div>
             </section>
           )}
           {tab === "sources" && (
-            <section className="sources-view">
-              <div className="section-top">
+            <section className="panel">
+              <div className="section-heading">
                 <div>
-                  <h2>Source health & coverage</h2>
-                  <p>
-                    {overview?.connectors_enabled
-                      ? "Scheduled ingestion is enabled."
-                      : "Scheduled ingestion is paused. An administrator can poll an enabled source below."}
+                  <h2>External GCN subscriptions</h2>
+                  <p className="muted">
+                    GCN status: {overview?.gcn.state} · Heartbeat:{" "}
+                    {date(overview?.gcn.heartbeat)}
                   </p>
                 </div>
-                <span className="pill">
-                  {sources.filter((s) => s.state === "healthy").length} healthy
-                  / {sources.length} configured
-                </span>
+                <span className="tag">Kafka → durable inbox → agents</span>
               </div>
-              <div className="source-table">
-                <div className="source-row table-head">
-                  <span>SOURCE</span>
-                  <span>COUNTRY</span>
-                  <span>STATUS</span>
-                  <span>LAST SUCCESS</span>
-                  <span>ACTION</span>
-                </div>
+              <div className="source-list">
                 {sources.map((s) => (
                   <div className="source-row" key={s.id}>
                     <div>
-                      <a
-                        href={s.definition.url}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <b>{s.definition.name}</b>
-                        <ExternalLink size={12} />
-                      </a>
+                      <code>{s.id}</code>
                       <small>
-                        {s.definition.kind.toUpperCase()} · {s.item_count} items
+                        {agents.find((a) => a.id === s.definition.agent_id)
+                          ?.name || s.definition.agent_id}
                       </small>
-                      {(s.error || s.definition.reason) && (
-                        <p>{s.error || s.definition.reason}</p>
-                      )}
+                      {s.error && <p className="error-text">{s.error}</p>}
                     </div>
-                    <span>
-                      {countries[s.definition.country]?.flag}{" "}
-                      {countries[s.definition.country]?.name}
-                    </span>
-                    <span className={"source-state " + s.state}>
+                    <span className={"status " + s.state}>
                       {s.state.replaceAll("_", " ")}
                     </span>
-                    <span>{timeAgo(s.last_success)}</span>
-                    <button
-                      className="mini"
-                      disabled={
-                        !s.definition.enabled ||
-                        busy ||
-                        overview?.role !== "admin"
-                      }
-                      onClick={() =>
-                        act(
-                          () =>
-                            api(`/sources/${s.id}/poll`, { method: "POST" }),
-                          "Source refreshed",
-                        )
-                      }
-                    >
-                      <RefreshCw size={13} />
-                      Poll now
-                    </button>
+                    <div>
+                      <b>{s.item_count}</b>
+                      <small>messages retained</small>
+                    </div>
+                    <time>{date(s.last_success)}</time>
                   </div>
                 ))}
               </div>
-              <div className="source-footnote">
-                <ShieldCheck size={19} />
+              <p className="source-note">
+                A quiet instrument can be healthy. Connection heartbeats and
+                Kafka lag are tracked separately from the last scientific alert.
+              </p>
+              {overview?.gcn.lag && (
+                <details>
+                  <summary>Partition lag</summary>
+                  <pre>{JSON.stringify(overview.gcn.lag, null, 2)}</pre>
+                </details>
+              )}
+            </section>
+          )}
+          {tab === "subscriptions" && (
+            <section className="preferences panel">
+              <div>
+                <h2>Your observation interests</h2>
                 <p>
-                  Disabled integrations need publisher access or parser
-                  validation. Source claims retain their URLs and original
-                  evidence. News mentions alone do not establish an event’s
-                  location.
+                  Leave everything unselected to receive the full observatory
+                  briefing. Corrections to previously delivered findings still
+                  reach you.
                 </p>
+              </div>
+              <div>
+                <h3>Signal families</h3>
+                {Object.entries(familyNames).map(([id, label]) => (
+                  <label className="checkbox" key={id}>
+                    <input
+                      type="checkbox"
+                      checked={prefs.families.includes(id)}
+                      onChange={(e) =>
+                        editPrefs({
+                          ...prefs,
+                          families: e.target.checked
+                            ? [...prefs.families, id]
+                            : prefs.families.filter((f) => f !== id),
+                        })
+                      }
+                    />
+                    {label}
+                  </label>
+                ))}
+                <h3>Instruments</h3>
+                <div className="instrument-options">
+                  {agents
+                    .filter((a) => a.level === "instrument")
+                    .map((a) => (
+                      <label className="checkbox" key={a.id}>
+                        <input
+                          type="checkbox"
+                          checked={prefs.instruments.includes(a.id)}
+                          onChange={(e) =>
+                            editPrefs({
+                              ...prefs,
+                              instruments: e.target.checked
+                                ? [...prefs.instruments, a.id]
+                                : prefs.instruments.filter((i) => i !== a.id),
+                            })
+                          }
+                        />
+                        {a.name}
+                      </label>
+                    ))}
+                </div>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={prefs.multi_messenger_only}
+                    onChange={(e) =>
+                      editPrefs({
+                        ...prefs,
+                        multi_messenger_only: e.target.checked,
+                      })
+                    }
+                  />{" "}
+                  Only briefings with multiple signal families
+                </label>
+                <p className="muted">
+                  Multiple families can include follow-up searches and
+                  non-detections.
+                </p>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() =>
+                    void action(async () => {
+                      await call("/preferences", {
+                        method: "PUT",
+                        body: JSON.stringify(prefs),
+                      });
+                      preferencesDirty.current = false;
+                    }, "Subscriptions saved")
+                  }
+                >
+                  Save subscriptions <Check size={16} />
+                </button>
               </div>
             </section>
           )}
-          {tab === "settings" && prefs && (
-            <PreferencesEditor
-              value={prefs}
-              agents={agents}
-              onSave={(p) =>
-                act(
-                  () =>
-                    api("/preferences", {
-                      method: "PUT",
-                      body: JSON.stringify(p),
-                    }),
-                  "Trip preferences saved",
-                )
-              }
-              busy={busy}
-            />
-          )}
           <footer>
             <span>
-              <IconMark /> Baltic Guide
+              <Telescope size={15} /> Space Observatory
             </span>
-            <p>Local evidence. Shared perspective.</p>
-            <a href="/docs" target="_blank">
+            <p>Many signals. Traceable evidence.</p>
+            <a href={base + "/docs"} target="_blank" rel="noreferrer">
               API documentation <ExternalLink size={12} />
             </a>
           </footer>
         </div>
       </main>
-      {notice && (
-        <div className="toast" role="status">
-          <CheckCheck size={18} />
-          {notice}
-        </div>
-      )}
-      {selected && (
-        <div className="drawer-backdrop" onClick={() => setSelected(null)}>
-          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+      {(selected || detail) && (
+        <div
+          className="drawer-backdrop"
+          onClick={() => {
+            setSelected(null);
+            setDetail(null);
+          }}
+        >
+          <aside
+            className="drawer"
+            onClick={(e) => e.stopPropagation()}
+            aria-label="Details"
+          >
             <button
-              className="drawer-close"
-              onClick={() => setSelected(null)}
-              aria-label="Close agent details"
+              className="drawer-close icon-button"
+              aria-label="Close details"
+              onClick={() => {
+                setSelected(null);
+                setDetail(null);
+              }}
             >
               <X />
             </button>
-            <div className="coordinator-icon">
-              <MapPin size={25} />
-            </div>
             <span className="eyebrow">
-              {selected.level.toUpperCase()} AGENT
+              {selected ? `${selected.level} AGENT` : "EVENT CASE FILE"}
             </span>
-            <h2>{selected.name}</h2>
-            <span className="pill">{selected.state}</span>
-            <div className="drawer-stats">
-              <Stat
-                label="OBSERVATIONS"
-                value={selected.memory.fact_count || 0}
-                note="Persistent factual memory"
-                icon={<Layers3 size={16} />}
-              />
-              <Stat
-                label="COMPLETED RUNS"
-                value={selected.runs}
-                note={timeAgo(selected.last_run)}
-                icon={<Activity size={16} />}
-              />
-            </div>
-            {selected.memory.assessment && (
+            <h2>{selected?.name || detail?.name}</h2>
+            {selected && (
               <>
-                <h3>Agent assessment</h3>
-                <p className="memory-item">{selected.memory.assessment}</p>
-                <p className="muted">
-                  Model interpretation of stored evidence.
+                <span className="status">{selected.state}</span>
+                <p>
+                  {selected.runs} completed runs · {selected.pending} pending
+                  jobs
                 </p>
+                <p className="muted">
+                  Heartbeat: {date(selected.last_heartbeat)}
+                </p>
+                {selected.memory.assessment && (
+                  <div className="interpretation">
+                    <span>Agent interpretation</span>
+                    <p>{selected.memory.assessment}</p>
+                  </div>
+                )}
+                <h3>Recent evidence</h3>
+                {selected.memory.recent_titles?.map((t, i) => (
+                  <p className="memory-line" key={i}>
+                    {t}
+                  </p>
+                ))}
+                {!selected.memory.recent_titles?.length && (
+                  <p className="muted">Waiting for relevant source reports.</p>
+                )}
+                <details>
+                  <summary>Agent interface</summary>
+                  <code>{selected.topic}</code>
+                  <p>
+                    A2A endpoint: {base}/a2a/{selected.id}/
+                  </p>
+                </details>
               </>
             )}
-            {selected.memory.model_error && (
-              <p className="muted">{selected.memory.model_error}</p>
+            {detail && (
+              <>
+                <Brief value={detail.briefing!} openCase={() => {}} />
+                <h3>Current source reports</h3>
+                {detail.reports.map((r) => (
+                  <div className="evidence" key={r.id}>
+                    <span className={"status " + r.payload.status}>
+                      {r.payload.status} · {r.payload.kind}
+                    </span>
+                    <h4>{r.payload.title}</h4>
+                    <p>{r.payload.summary}</p>
+                    <a
+                      href={safeUrl(r.payload.source_url)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Source reference <ExternalLink size={12} />
+                    </a>
+                    <details>
+                      <summary>Measurements and source references</summary>
+                      <pre>
+                        {JSON.stringify(
+                          {
+                            metadata: r.payload.metadata,
+                            references: r.payload.references,
+                          },
+                          null,
+                          2,
+                        )}
+                      </pre>
+                    </details>
+                    <button
+                      className="text-button"
+                      onClick={() =>
+                        void action(async () => {
+                          const raw = await call<{ payload: string }>(
+                            "/raw/" + r.payload.raw_id,
+                          );
+                          const u = URL.createObjectURL(
+                            new Blob([raw.payload], { type: "text/plain" }),
+                          );
+                          const a = document.createElement("a");
+                          a.href = u;
+                          a.download =
+                            "gcn-" + r.payload.raw_id.slice(0, 12) + ".txt";
+                          a.click();
+                          setTimeout(() => URL.revokeObjectURL(u), 1000);
+                        })
+                      }
+                    >
+                      Download original Kafka payload
+                    </button>
+                  </div>
+                ))}
+                <h3>Revision history</h3>
+                {detail.history.map((r) => (
+                  <div className="history-item" key={r.id}>
+                    <span>{date(r.payload.notice_time)}</span>
+                    <p>
+                      {r.payload.title} · {r.payload.status}
+                    </p>
+                  </div>
+                ))}
+              </>
             )}
-            <h3>Recent observations</h3>
-            {selected.memory.recent_titles?.length ? (
-              selected.memory.recent_titles.map((t) => (
-                <p className="memory-item" key={t}>
-                  {t}
-                </p>
-              ))
-            ) : (
-              <p className="muted">
-                No observations yet. This agent will wake when relevant data
-                arrives.
-              </p>
-            )}
-            <h3>Ask this agent</h3>
-            <textarea
-              aria-label="Ask selected agent"
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder={`What’s happening in ${selected.name}?`}
-            />
-            <button
-              className="primary"
-              disabled={busy || !question.trim()}
-              onClick={ask}
-            >
-              <Send size={15} />
-              Send request
-            </button>
-            <a
-              className="agent-card-link"
-              href={`/a2a/${selected.id}/.well-known/agent-card.json`}
-              target="_blank"
-            >
-              A2A Agent Card <ExternalLink size={13} />
-            </a>
-            {selected.last_error && (
-              <div className="error-banner">{selected.last_error}</div>
-            )}
+            <div className="drawer-question">
+              <h3>Ask {selected ? "this agent" : "the case agent"}</h3>
+              <textarea
+                aria-label="Question for selected agent"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                placeholder="What does the evidence establish?"
+              />
+              <button
+                className="primary"
+                disabled={!question.trim() || busy}
+                onClick={() => void ask()}
+              >
+                Send request <Send size={15} />
+              </button>
+            </div>
           </aside>
         </div>
       )}
-    </div>
-  );
-}
-function Stat({
-  label,
-  value,
-  note,
-  icon,
-}: {
-  label: string;
-  value: string | number;
-  note: string;
-  icon: React.ReactNode;
-}) {
-  return (
-    <div className="stat">
-      <div>
-        <span>{label}</span>
-        {icon}
-      </div>
-      <strong>{value}</strong>
-      <p>{note}</p>
-    </div>
-  );
-}
-function PreferencesEditor({
-  value,
-  agents,
-  onSave,
-  busy,
-}: {
-  value: Preferences;
-  agents: Agent[];
-  onSave: (p: Preferences) => void;
-  busy: boolean;
-}) {
-  const [p, setP] = useState(value);
-  const toggle = (key: "city_ids" | "countries" | "interests", id: string) =>
-    setP({
-      ...p,
-      [key]: p[key].includes(id)
-        ? p[key].filter((x) => x !== id)
-        : [...p[key], id],
-    });
-  return (
-    <section className="preferences">
-      <div className="preference-intro">
-        <SlidersHorizontal size={25} />
-        <h2>Your next tour, in focus.</h2>
-        <p>
-          Subscriptions apply to new findings. Corrections to messages you
-          already received will still reach you.
-        </p>
-      </div>
-      <div className="preference-form">
-        <h3>Countries & cities</h3>
-        <p className="muted">
-          Leave all unselected to follow the full network. Selected countries
-          include all their cities.
-        </p>
-        {Object.entries(countries).map(([code, c]) => (
-          <div className="preference-country" key={code}>
-            <label>
-              <input
-                type="checkbox"
-                checked={p.countries.includes(code)}
-                onChange={() => toggle("countries", code)}
-              />
-              {c.flag} {c.name}
-            </label>
-            <div>
-              {agents
-                .filter((a) => a.country === code && a.city_id)
-                .map((a) => (
-                  <button
-                    key={a.id}
-                    className={
-                      p.city_ids.includes(a.city_id!) ? "chip active" : "chip"
-                    }
-                    onClick={() => toggle("city_ids", a.city_id!)}
-                  >
-                    {a.name}
-                  </button>
-                ))}
-            </div>
-          </div>
-        ))}
-        <h3>Travel dates</h3>
-        <div className="date-inputs">
-          <label>
-            From
-            <input
-              type="date"
-              value={p.starts_at?.slice(0, 10) || ""}
-              onChange={(e) =>
-                setP({
-                  ...p,
-                  starts_at: e.target.value
-                    ? e.target.value + "T00:00:00Z"
-                    : null,
-                })
-              }
-            />
-          </label>
-          <label>
-            Through
-            <input
-              type="date"
-              value={p.ends_at?.slice(0, 10) || ""}
-              onChange={(e) =>
-                setP({
-                  ...p,
-                  ends_at: e.target.value
-                    ? e.target.value + "T23:59:59Z"
-                    : null,
-                })
-              }
-            />
-          </label>
-        </div>
-        <h3>Group interests</h3>
-        <div className="interest-chips">
-          {[
-            "christmas",
-            "music",
-            "festival",
-            "food",
-            "art",
-            "outdoors",
-            "transport",
-            "sport",
-          ].map((t) => (
-            <button
-              className={p.interests.includes(t) ? "chip active" : "chip"}
-              key={t}
-              onClick={() => toggle("interests", t)}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-        <p className="muted">
-          Disruptions bypass interest filters so relevant cancellations aren’t
-          missed.
-        </p>
-        <label className="language-label">
-          Briefing language
-          <select
-            value={p.language}
-            onChange={(e) => setP({ ...p, language: e.target.value })}
-          >
-            <option value="en">English</option>
-            <option value="et">Estonian</option>
-            <option value="lv">Latvian</option>
-            <option value="lt">Lithuanian</option>
-            <option value="de">German</option>
-          </select>
-        </label>
-        <p className="muted">
-          Generated translations require a configured language model; source
-          text is preserved.
-        </p>
-        <button className="primary" disabled={busy} onClick={() => onSave(p)}>
+      {notice && (
+        <div className="toast" role="status">
           <Check size={16} />
-          Save preferences
-        </button>
-      </div>
-    </section>
+          {notice}
+        </div>
+      )}
+    </div>
   );
 }

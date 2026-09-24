@@ -1,18 +1,16 @@
-.PHONY: install ui demo serve test lint integration
+.PHONY: install test build up down logs
 install:
-	uv sync --extra dev
+	uv sync --frozen --extra dev
 	cd frontend && npm ci
-ui:
-	cd frontend && npm run build
-demo: ui
-	uv run baltic demo
-	uv run baltic serve
-serve:
-	uv run baltic serve
 test:
+	uv run ruff check backend scripts
 	uv run pytest -q
-lint:
-	uv run ruff check backend
+	cd frontend && npm test
+build:
 	cd frontend && npm run build
-integration:
-	uv run pytest -q backend/tests/test_integration.py
+up:
+	docker compose up --build -d
+down:
+	docker compose down
+logs:
+	docker compose logs -f api worker ingestor

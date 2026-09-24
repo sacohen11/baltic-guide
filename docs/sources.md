@@ -1,69 +1,34 @@
-# Onboarding live sources
+# External GCN streams
 
-`config/sources.yaml` is the source registry. Bootstrap updates source definitions without deleting observed health or history. Restart after editing it. Run one dedicated connector scheduler initially; polling leases prevent concurrent claims for the same due source.
+This app consumes existing Kafka topics from `kafka.gcn.nasa.gov:9092` using TLS and OAuth bearer authentication. Create a GCN account/client at https://gcn.nasa.gov/quickstart. The internal broker and external broker are separate.
 
-The enabled defaults are public broadcaster news feeds in all three countries. Scheduled fetching remains an explicit operational switch. LSM Culture, ERR News, and LRT English returned parseable RSS during implementation (50, 50, and 100 entries respectively). Treat this as a point-in-time fetch check, not a coverage guarantee or approval to redistribute full publisher content.
+| External topic / suffix | Agent | Format |
+|---|---|---|
+| `igwn.gwalert` | LVK | JSON |
+| `gcn.notices.icecube.gold_bronze_track_alerts` | IceCube | JSON |
+| `gcn.notices.icecube.lvk_nu_track_search` | IceCube | JSON |
+| `gcn.notices.swift.bat.guano` | Swift BAT | JSON |
+| `gcn.circulars` | Circulars | JSON |
+| `gcn.classic.text.FERMI_GBM_ALERT`, `FERMI_GBM_FLT_POS`, `FERMI_GBM_GND_POS`, `FERMI_GBM_FIN_POS`, `FERMI_GBM_SUBTHRESH` | Fermi GBM | Classic text |
+| `gcn.classic.text.FERMI_LAT_POS_INI`, `FERMI_LAT_POS_UPD`, `FERMI_LAT_GND`, `FERMI_LAT_OFFLINE`, `FERMI_LAT_TRANS` | Fermi LAT | Classic text |
+| `gcn.classic.text.SWIFT_BAT_GRB_POS_ACK` | Swift BAT | Classic text |
+| `gcn.classic.text.SWIFT_XRT_POSITION` | Swift XRT | Classic text |
+| `gcn.classic.text.SWIFT_UVOT_POS` | Swift UVOT | Classic text |
 
-## RSS/Atom
+All classic suffixes in a row use the same `gcn.classic.text.` prefix. The registry contains the full strings. Availability is verified against broker metadata at startup; access was not assumed from documentation alone. Missing topics fail clearly and can be removed explicitly via `GCN_TOPICS`.
 
-```yaml
-- id: approved-city-news
-  name: City newsroom
-  country: lv
-  city_ids: ["lv:riga"]
-  language: lv
-  kind: rss
-  url: https://publisher.example/feed.xml
-  enabled: true
-  interval_seconds: 600
-```
+Original message bytes are retained as base64 alongside their UTF-8 text representation; invalid UTF-8 is quarantined. Classic measurements remain in `classic_fields` so units and original formatting are not silently altered. GUANO and IceCube string-array IDs are handled explicitly. The IceCube LVK-search legacy schema has no `alert_tense`; its valid LVK identifier distinguishes live (`S...`) and mock/test (`MS...`/`TS...`) references. Other JSON notice schemas require a known `alert_tense`.
 
-Use `city_ids` only for a source with established city scope. National article mentions populate `candidate_city_ids`; agents receive those articles as potentially relevant news with a qualification. Article publication dates are not event dates. A national article with no resolved city wakes the country agent.
+Parser implementation references, checked September 23, 2026:
 
-## JSON-LD event pages
+- https://gcn.nasa.gov/docs/client
+- https://gcn.nasa.gov/missions/fermi
+- https://gcn.nasa.gov/missions/swift
+- https://gcn.nasa.gov/missions/icecube
+- https://gcn.nasa.gov/missions/lvk
+- https://emfollow.docs.ligo.org/userguide/content.html
+- https://gcn.nasa.gov/docs/circulars/subscribing
+- https://github.com/nasa-gcn/gcn-schema/blob/main/gcn/notices/icecube/lvk_nu_track_search.example.json
+- https://gcn.nasa.gov/docs/schema/v7.1.0/gcn/notices/swift/bat/Guano.schema.json
 
-Set `kind: html_jsonld` on a permitted page containing `application/ld+json` schema.org Events. Nested `@graph` and item lists are supported. Structured address locality can identify a monitored city; an arbitrary mention in body text cannot establish an event venue. Listing pages that only link to events require a publisher-specific adapter; the connector deliberately reports an extraction error if no events can be parsed.
-
-## JSON API mapping
-
-The parser accepts schema.org-like objects or an explicit field mapping:
-
-```yaml
-- id: approved-events-api
-  name: Approved organizer API
-  country: ee
-  city_ids: ["ee:tallinn"]
-  kind: json
-  url: https://publisher.example/api/events
-  url_env: APPROVED_EVENTS_URL
-  token_env: APPROVED_EVENTS_TOKEN
-  items_path: data.events
-  field_map:
-    identifier: id
-    name: title
-    description: description
-    url: public_url
-    startDate: starts_at
-    endDate: ends_at
-    dateModified: updated_at
-    eventStatus: schema_org_status
-  authoritative: true
-  enabled: true
-  interval_seconds: 1800
-```
-
-Mapping paths support nested object keys. The mapped target names are the parser's schema.org fields. `eventStatus` should contain `EventCancelled` or `EventPostponed` for those states; adapt publisher-specific enums before ingestion. Do not enable the Visit Estonia placeholder URL as if it were a functioning data endpoint: configure the approved API URL, token, and fields first.
-
-## ICS
-
-`kind: ics` accepts explicit VEVENT instances. Set source city scope. UID establishes source identity; STATUS=CANCELLED propagates cancellation; timezone-aware dates are normalized to UTC. Recurrence rules are rejected so missing occurrences cannot be silently advertised as complete coverage. Obtain an expanded feed or add a bounded recurrence adapter before using recurring calendars. An absent end date remains unknown, and the item cannot support a date-overlap theme.
-
-## Validation procedure
-
-1. Establish permitted access and which fields can be retained/displayed. Choose a stable source ID and canonical event IDs.
-2. Fetch a representative sample, including one correction/cancellation; inspect extracted location, timezone, language, dates, status, identity, and URLs.
-3. Add a fixture-based parser test. Do not check private feeds, tokens, or licensed full articles into git.
-4. Poll the enabled source and inspect `/api/sources`, `/api/facts`, and affected city memory. Empty extraction is an error unless `allow_empty:true` is deliberately configured.
-5. Measure false city matches and missing events with a guide before calling coverage complete.
-
-Connectors use HTTPS, reject non-public resolved addresses and embedded URL credentials, do not follow redirects, cap responses at 5 MB, use ETag/Last-Modified, and back off after failures. Source URLs are operator-controlled. Production should additionally apply network egress controls; DNS prechecks alone are not a complete DNS-rebinding defense.
+Schema drift is quarantined instead of silently inventing missing timestamps/identifiers. This is operational parsing and domain validation, not full remote JSON-Schema validation. The consumer never fetches arbitrary schema or payload URLs during ingestion.
