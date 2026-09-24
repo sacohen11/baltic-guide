@@ -76,6 +76,13 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in .env}"]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
   caddy:
     image: caddy:2-alpine
     profiles: ["https"]

@@ -22,6 +22,16 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+      - name: Validate Mac tunnel Compose profile
+        run: |
+          cp .env.example .env
+          docker compose --profile tunnel config --quiet
+        env:
+          ADMIN_TOKEN: ci-only-test-token
+          POSTGRES_PASSWORD: ci-only-test-password
+          GCN_CLIENT_ID: ci-only-client-id
+          GCN_CLIENT_SECRET: ci-only-client-secret
+          CLOUDFLARE_TUNNEL_TOKEN: ci-only-tunnel-token
       - run: docker build -t space-observatory:ci .
   kafka-postgres:
     runs-on: ubuntu-latest

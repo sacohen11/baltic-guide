@@ -44,6 +44,31 @@ The default subscribes to all topics in `backend/observatory/registry.py`. If GC
 
 GitHub Pages hosts static frontend files. It cannot run Python, PostgreSQL, Kafka consumers, or agent workers. The backend must run on an always-on computer or server with Docker, outbound access to GCN Kafka on port 9092, and HTTPS access to GCN OAuth and the configured model endpoint.
 
+### Mac mini + Cloudflare Tunnel
+
+This is the recommended single-machine setup for a Mac mini. Install Docker Desktop and enable **Start Docker Desktop when you sign in**. In macOS **System Settings → Energy**, turn on **Prevent automatic sleeping when the display is off** and **Start up automatically after a power failure**. After a full reboot, Docker Desktop needs a user session to start; test that the services actually come back before relying on this unattended.
+
+1. Follow the [local setup](#run-the-real-application-on-your-computer) through creating `.env` and setting NASA GCN credentials, `ADMIN_TOKEN`, and `POSTGRES_PASSWORD`. Leave the secrets only in the Mac's `.env` file.
+2. Add a domain you control to Cloudflare. In **Cloudflare Zero Trust → Networking → Tunnels**, create a **remotely managed** Cloudflare Tunnel with a Docker connector. Copy its tunnel token into `CLOUDFLARE_TUNNEL_TOKEN` in `.env`. Do not use a temporary Quick Tunnel: this dashboard uses a streaming connection and needs a stable hostname.
+3. Give the tunnel a public hostname, such as `api.yourdomain.com`, with service URL **`http://api:8000`**. The `tunnel` and `api` containers share a Docker Compose network; `localhost` inside the tunnel container would point to the tunnel itself. The tunnel makes an outbound connection, so no router port forwarding or public home IP is needed.
+4. In `.env`, set `PUBLIC_URL=https://api.yourdomain.com` and `CORS_ORIGINS=https://sacohen11.github.io`. If the dashboard will also run on a custom domain, add its full HTTPS origin separated by a comma. Do not append `/baltic-guide/` to an origin.
+5. Start all services from the repository directory on the Mac:
+
+```sh
+docker compose --profile tunnel up --build -d
+docker compose --profile tunnel ps
+docker compose --profile tunnel logs --tail=50 tunnel ingestor worker
+curl -fsS https://api.yourdomain.com/healthz
+```
+
+The last command should return `{"status":"ok"}`. Check `/readyz` when GCN has connected; it returns 503 until a worker and the external GCN subscription are both healthy. If the tunnel reports a 502 error, confirm the Cloudflare service URL is `http://api:8000` and inspect `docker compose logs api tunnel`. Kafka and PostgreSQL are kept on the private Compose network. The API's direct host port is bound to the Mac's loopback address for local troubleshooting.
+
+In the GitHub repository, enable **Settings → Pages → Build and deployment → GitHub Actions**. Under **Settings → Secrets and variables → Actions → Variables**, set `OBSERVATORY_API_URL` to your public HTTPS API origin (`https://api.yourdomain.com`), or leave it unset and enter the backend URL on the dashboard sign-in screen. Run **Deploy observatory frontend to GitHub Pages** from Actions. Open the URL reported by that deployment and enter the observer or admin token from your Mac's `.env`. The browser sends requests directly from the Pages site to your tunnel hostname; GitHub does not receive the backend secret. The Pages site itself is public, including for a private repository if your GitHub plan permits Pages.
+
+Mac downtime, home internet outages, and a stopped Docker Desktop interrupt live ingestion. Persistent Docker volumes hold PostgreSQL and Kafka data across restarts, but back up the database to a separate location; see [operations](docs/operations.md). Once connectivity returns, the GCN consumer resumes its committed offsets while Kafka retains them.
+
+### Server with inbound HTTPS
+
 On that host, follow the preceding setup, then point a domain's DNS at the server. In `.env` set:
 
 ```dotenv
