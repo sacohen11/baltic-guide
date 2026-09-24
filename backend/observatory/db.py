@@ -208,8 +208,10 @@ class Database:
             from sqlalchemy.dialects.postgresql import insert
         else:
             from sqlalchemy.dialects.sqlite import insert
-        result = conn.execute(insert(table).values(**values).on_conflict_do_nothing(index_elements=[key]))
-        return result.rowcount > 0
+        # psycopg may report -1 for rowcount even when INSERT succeeds. RETURNING
+        # distinguishes a new row from ON CONFLICT DO NOTHING on both databases.
+        stmt = insert(table).values(**values).on_conflict_do_nothing(index_elements=[key]).returning(table.c[key])
+        return conn.execute(stmt).scalar_one_or_none() is not None
 
     def rows(self, table, where=None, limit=None, order=None):
         stmt = select(table)
